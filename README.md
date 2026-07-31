@@ -20,7 +20,7 @@ Small Python project organized with a `src/` layout and a dedicated virtual envi
 ## Run
 
 ```bash
-python -m tlsping.main --port NTS-KE gbg2-ts.nts.netnod.se
+python -m tlsping.main --port NTS-KE nts.netnod.se
 ```
 
 ## Test
