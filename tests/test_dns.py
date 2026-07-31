@@ -27,6 +27,20 @@ class DnsCompatibilityTests(unittest.TestCase):
         self.assertEqual(["ns1.example.com"], [ns.host for ns in nameservers])
         self.assertIn(("example.com", "NS"), fake_resolver.calls)
 
+    def test_nameserver_whois_fields_are_exposed(self) -> None:
+        with patch.object(dns_module.dns.resolver, "Resolver") as resolver_cls, patch.object(
+            dns_module,
+            "_collect_whois_via_cli",
+            return_value=SimpleNamespace(descr="Netnod NDS Service", country="SE"),
+        ):
+            resolver_cls.return_value.resolve.side_effect = [
+                [SimpleNamespace(target=SimpleNamespace(to_text=lambda: "ns1.example.com."))]
+            ]
+            nameservers = dns_module._resolve_nameservers("example.com")
+
+        self.assertEqual("Netnod NDS Service", nameservers[0].descr)
+        self.assertEqual("SE", nameservers[0].country)
+
     def test_collect_dns_report_uses_cli_whois_fallback(self) -> None:
         original_import = builtins.__import__
 
@@ -50,3 +64,38 @@ class DnsCompatibilityTests(unittest.TestCase):
         self.assertEqual("Example Registrar", report.registrar.registrar)
         self.assertEqual("SE", report.registrar.country)
         self.assertTrue(all("WHOIS" not in warning for warning in report.warnings))
+
+    def test_resolve_nameservers_uses_ip_whois_metadata(self) -> None:
+        class FakeResolver:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def resolve(self, domain: str, rdtype: str):
+                if domain == "example.com" and rdtype == "NS":
+                    return [SimpleNamespace(target=SimpleNamespace(to_text=lambda: "ns1.example.com."))]
+                if domain == "ns1.example.com" and rdtype == "A":
+                    return [SimpleNamespace(address="192.0.2.1")]
+                if domain == "ns1.example.com" and rdtype == "AAAA":
+                    return []
+                raise AssertionError(f"unexpected lookup: {domain} {rdtype}")
+
+            def query(self, domain: str, rdtype: str):
+                raise AssertionError(f"query should not be used: {domain} {rdtype}")
+
+        fake_resolver = FakeResolver()
+
+        def fake_collect_whois(target: str):
+            if target == "192.0.2.1":
+                return SimpleNamespace(descr="Netnod NDS Service", country="SE", registrar=None, source=None)
+            return None
+
+        with patch.object(dns_module.dns.resolver, "Resolver", return_value=fake_resolver), patch.object(
+            dns_module,
+            "_collect_whois_via_cli",
+            side_effect=fake_collect_whois,
+        ):
+            nameservers = dns_module._resolve_nameservers("example.com")
+
+        self.assertEqual(1, len(nameservers))
+        self.assertEqual("Netnod NDS Service", nameservers[0].descr)
+        self.assertEqual("SE", nameservers[0].country)

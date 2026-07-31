@@ -12,12 +12,15 @@ class RegistrarInfo:
     registrar: Optional[str] = None
     source: Optional[str] = None
     country: Optional[str] = None
+    descr: Optional[str] = None
 
 
 @dataclass
 class NameserverInfo:
     host: str
     addresses: List[str]
+    descr: Optional[str] = None
+    country: Optional[str] = None
 
 
 @dataclass
@@ -81,6 +84,10 @@ def _extract_from_raw(raw_text: str) -> RegistrarInfo:
             registrar_info.source = normalized_value
         elif normalized_key == "country" and not registrar_info.country:
             registrar_info.country = normalized_value
+        elif normalized_key in {"descr", "description"} and not getattr(registrar_info, "descr", None):
+            if normalized_value.startswith("-----BEGIN CERTIFICATE-----"):
+                continue
+            setattr(registrar_info, "descr", normalized_value)
 
     return registrar_info
 
@@ -129,7 +136,22 @@ def _resolve_nameservers(domain: str) -> List[NameserverInfo]:
         except Exception:
             pass
 
-        results.append(NameserverInfo(host=host, addresses=sorted(set(addresses))))
+        whois_info = None
+        lookup_targets = [host, host.split(".", 1)[-1], domain]
+        lookup_targets.extend(addresses)
+        for candidate in lookup_targets:
+            whois_info = _collect_whois_via_cli(candidate)
+            if whois_info and (whois_info.descr or whois_info.country):
+                break
+
+        results.append(
+            NameserverInfo(
+                host=host,
+                addresses=sorted(set(addresses)),
+                descr=whois_info.descr if whois_info else None,
+                country=whois_info.country if whois_info else None,
+            )
+        )
 
     return results
 
@@ -210,7 +232,9 @@ def display_dns_report(hostname: str) -> None:
     if report.nameservers:
         for ns in report.nameservers:
             joined_ips = ", ".join(ns.addresses) if ns.addresses else "N/A"
-            print(f"  - {ns.host}: {joined_ips}")
+            descr = f" | descr: {ns.descr}" if ns.descr else ""
+            country = f" | country: {ns.country}" if ns.country else ""
+            print(f"  - {ns.host}: {joined_ips}{descr}{country}")
     else:
         print("  - N/A")
 
