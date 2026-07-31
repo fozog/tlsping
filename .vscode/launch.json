@@ -1,0 +1,21 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: tlsping",
+            "type": "python",
+            "request": "launch",
+            "module": "tlsping.main",
+            "args": [
+                "--port",
+                "NTS-KE",
+                "nts.netnod.se"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src"
+            }
+        }
+    ]
+}
