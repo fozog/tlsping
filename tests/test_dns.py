@@ -41,6 +41,60 @@ class DnsCompatibilityTests(unittest.TestCase):
         self.assertEqual("Netnod NDS Service", nameservers[0].descr)
         self.assertEqual("SE", nameservers[0].country)
 
+    def test_collect_dns_report_parses_registrar_blocks_and_record_maintained_by(self) -> None:
+        original_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "whois":
+                raise ImportError("python-whois unavailable")
+            return original_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=fake_import), patch.object(
+            dns_module.subprocess,
+            "run",
+            return_value=SimpleNamespace(
+                returncode=0,
+                stdout="Registrar:\n   Example Registrar\n   1 Main Street\nRecord maintained by: Example Registry\nCountry: SE\n",
+                stderr="",
+            ),
+        ), patch.object(dns_module.dns.resolver, "Resolver") as resolver_cls:
+            resolver_cls.return_value.resolve.side_effect = lambda *args, **kwargs: []
+            report = dns_module.collect_dns_report("example.com")
+
+        self.assertEqual("Example Registrar\n1 Main Street", report.registrar.registrar)
+        self.assertEqual("SE", report.registrar.country)
+
+    def test_extract_from_raw_preserves_record_maintained_by(self) -> None:
+        raw_text = "Registrar:\n   Example Registrar\n   1 Main Street\n\nRecord maintained by: Example Registry\nCountry: SE\n"
+
+        parsed = dns_module._extract_from_raw(raw_text)
+
+        self.assertEqual("Example Registrar\n1 Main Street", parsed.registrar)
+        self.assertEqual("Example Registry", parsed.record_maintained_by)
+        self.assertEqual("SE", parsed.country)
+
+    def test_collect_dns_report_uses_cli_whois_fallback_for_record_maintained_by(self) -> None:
+        original_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "whois":
+                raise ImportError("python-whois unavailable")
+            return original_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=fake_import), patch.object(
+            dns_module.subprocess,
+            "run",
+            return_value=SimpleNamespace(
+                returncode=0,
+                stdout="Registrar:\n   Example Registrar\nRecord maintained by: Example Registry\nCountry: SE\n",
+                stderr="",
+            ),
+        ), patch.object(dns_module.dns.resolver, "Resolver") as resolver_cls:
+            resolver_cls.return_value.resolve.side_effect = lambda *args, **kwargs: []
+            report = dns_module.collect_dns_report("example.com")
+
+        self.assertEqual("Example Registry", report.registrar.record_maintained_by)
+
     def test_collect_dns_report_uses_cli_whois_fallback(self) -> None:
         original_import = builtins.__import__
 

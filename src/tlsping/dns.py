@@ -13,6 +13,7 @@ class RegistrarInfo:
     source: Optional[str] = None
     country: Optional[str] = None
     descr: Optional[str] = None
+    record_maintained_by: Optional[str] = None
 
 
 @dataclass
@@ -71,10 +72,63 @@ def _extract_from_raw(raw_text: str) -> RegistrarInfo:
     if not raw_text:
         return registrar_info
 
-    for line in raw_text.splitlines():
-        if ":" not in line:
+    lines = [line.rstrip() for line in raw_text.splitlines()]
+    in_registrar_block = False
+    registrar_lines: List[str] = []
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            if in_registrar_block:
+                continue
             continue
-        key, value = line.split(":", 1)
+
+        if stripped.lower() == "registrar:":
+            in_registrar_block = True
+            continue
+
+        if stripped.lower().startswith("record maintained by") or stripped.lower().startswith("record maintained by:"):
+            value = stripped.split(":", 1)[1].strip() if ":" in stripped else ""
+            if not registrar_info.record_maintained_by:
+                registrar_info.record_maintained_by = value
+            continue
+
+        if in_registrar_block:
+            if (
+                stripped.lower().startswith("abuse contact")
+                or stripped.lower().startswith("dnssec")
+                or stripped.lower().startswith("domain nameservers")
+            ):
+                in_registrar_block = False
+            else:
+                if ":" in stripped:
+                    key, value = stripped.split(":", 1)
+                    normalized_key = key.strip().lower()
+                    if normalized_key == "record maintained by" and not registrar_info.registrar and not registrar_lines:
+                        registrar_info.registrar = value.strip()
+                        continue
+                    if normalized_key == "country" and not registrar_info.country:
+                        registrar_info.country = value.strip()
+                        break
+                    if normalized_key == "record maintained by":
+                        continue
+                    if normalized_key in {"source"}:
+                        pass
+                    elif normalized_key in {"descr", "description"}:
+                        if value.strip().startswith("-----BEGIN CERTIFICATE-----"):
+                            continue
+                        registry_descr = value.strip()
+                        if registry_descr and not registrar_info.descr:
+                            registrar_info.descr = registry_descr
+                    else:
+                        pass
+                registrar_lines.append(stripped)
+            continue
+
+        if ":" not in stripped:
+            continue
+
+        key, value = stripped.split(":", 1)
         normalized_key = key.strip().lower()
         normalized_value = value.strip()
 
@@ -88,6 +142,11 @@ def _extract_from_raw(raw_text: str) -> RegistrarInfo:
             if normalized_value.startswith("-----BEGIN CERTIFICATE-----"):
                 continue
             setattr(registrar_info, "descr", normalized_value)
+        elif normalized_key == "record maintained by" and not registrar_info.registrar and not registrar_lines:
+            registrar_info.registrar = normalized_value
+
+    if not registrar_info.registrar and registrar_lines:
+        registrar_info.registrar = "\n".join(registrar_lines).strip()
 
     return registrar_info
 
@@ -173,7 +232,7 @@ def _collect_whois_via_cli(domain: str) -> Optional[RegistrarInfo]:
 
     raw_text = "\n".join(part for part in [completed.stdout, completed.stderr] if part)
     parsed = _extract_from_raw(raw_text)
-    if parsed.registrar or parsed.source or parsed.country:
+    if parsed.registrar or parsed.source or parsed.country or parsed.record_maintained_by:
         return parsed
     return None
 
@@ -190,6 +249,9 @@ def collect_dns_report(hostname: str) -> DnsReport:
         registrar.registrar = _to_scalar(getattr(whois_data, "registrar", None) or whois_data.get("registrar"))
         registrar.country = _to_scalar(getattr(whois_data, "country", None) or whois_data.get("country"))
         registrar.source = _to_scalar(getattr(whois_data, "source", None) or whois_data.get("source"))
+        registrar.record_maintained_by = _to_scalar(
+            getattr(whois_data, "record_maintained_by", None) or whois_data.get("record_maintained_by")
+        )
 
         raw_text = getattr(whois_data, "text", None) or whois_data.get("text") or ""
         parsed = _extract_from_raw(raw_text if isinstance(raw_text, str) else "")
@@ -200,6 +262,8 @@ def collect_dns_report(hostname: str) -> DnsReport:
             registrar.source = parsed.source
         if not registrar.country:
             registrar.country = parsed.country
+        if not registrar.record_maintained_by:
+            registrar.record_maintained_by = parsed.record_maintained_by
 
     except Exception:
         cli_whois = _collect_whois_via_cli(domain)
@@ -207,6 +271,17 @@ def collect_dns_report(hostname: str) -> DnsReport:
             registrar = cli_whois
         else:
             warnings.append("WHOIS lookup unavailable; registrar metadata unavailable")
+
+    if not registrar.record_maintained_by:
+        cli_whois = _collect_whois_via_cli(domain)
+        if cli_whois:
+            registrar.record_maintained_by = cli_whois.record_maintained_by
+            if not registrar.registrar:
+                registrar.registrar = cli_whois.registrar
+            if not registrar.source:
+                registrar.source = cli_whois.source
+            if not registrar.country:
+                registrar.country = cli_whois.country
 
     nameservers = _resolve_nameservers(domain)
     if not nameservers:
@@ -221,6 +296,7 @@ def display_dns_report(hostname: str, compact: bool = False) -> None:
     if compact:
         print(" [Registrar]")
         print(f"  - registrar : {report.registrar.registrar or 'N/A'}")
+        print(f"  - record maintained by : {report.registrar.record_maintained_by or 'N/A'}")
         print(f"  - source    : {report.registrar.source or 'N/A'}")
         print(f"  - country   : {report.registrar.country or 'N/A'}")
 
@@ -244,6 +320,9 @@ def display_dns_report(hostname: str, compact: bool = False) -> None:
 
     print("\n [Registrar]")
     print(f"  - registrar : {report.registrar.registrar or 'N/A'}")
+    print(
+        f"  - record maintained by : {report.registrar.record_maintained_by or 'N/A'}"
+    )
     print(f"  - source    : {report.registrar.source or 'N/A'}")
     print(f"  - country   : {report.registrar.country or 'N/A'}")
 
