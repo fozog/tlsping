@@ -215,8 +215,27 @@ def collect_dns_report(hostname: str) -> DnsReport:
     return DnsReport(domain=domain, registrar=registrar, nameservers=nameservers, warnings=warnings)
 
 
-def display_dns_report(hostname: str) -> None:
+def display_dns_report(hostname: str, compact: bool = False) -> None:
     report = collect_dns_report(hostname)
+
+    if compact:
+        print(" [Registrar]")
+        print(f"  - registrar : {report.registrar.registrar or 'N/A'}")
+        print(f"  - source    : {report.registrar.source or 'N/A'}")
+        print(f"  - country   : {report.registrar.country or 'N/A'}")
+
+        print("\n [Authoritative Nameservers]")
+        if report.nameservers:
+            for ns in report.nameservers:
+                parts = [ns.host.rstrip(".")]
+                if ns.descr:
+                    parts.append(f"descr: {ns.descr}")
+                if ns.country:
+                    parts.append(f"country: {ns.country}")
+                print(f"  - {' | '.join(parts)}")
+        else:
+            print("  - N/A")
+        return
 
     print("\n" + "=" * 60)
     print(f" DNS Summary for: {hostname}")

@@ -4,7 +4,7 @@ import argparse
 from typing import Optional
 
 from .dns import display_dns_report
-from .tls import display_cert_info, get_tls_certificate, set_trace_enabled, trace
+from .tls import assess_os_trust, display_cert_info, get_tls_certificate, set_trace_enabled, trace
 
 # Standard protocol port mappings
 PROTOCOL_PORTS = {
@@ -33,6 +33,69 @@ def resolve_port_spec(port_spec: Optional[str]) -> tuple[int, Optional[str]]:
     raise ValueError(f"Unknown port/protocol '{port_spec}'. Use an integer or one of: {valid}")
 
 
+def _display_compact_tls_summary(
+    hostname: str,
+    port: int,
+    der_cert: bytes,
+    cert_dict: Optional[dict],
+    tls_ver: str,
+    cipher: tuple[str, str, int],
+    starttls: Optional[str] = None,
+) -> None:
+    print("TLS:")
+    print(" [Subject Details]")
+
+    try:
+        from cryptography import x509
+        from cryptography.hazmat.backends import default_backend
+
+        cert = x509.load_der_x509_certificate(der_cert, default_backend())
+        subject_fields = [
+            ("countryName", "countryName"),
+            ("stateOrProvinceName", "stateOrProvinceName"),
+            ("localityName", "localityName"),
+            ("organizationName", "organizationName"),
+            ("commonName", "commonName"),
+        ]
+        for field_name, label in subject_fields:
+            values = [attr.value for attr in cert.subject if attr.oid._name == field_name]
+            if values:
+                print(f"  - {label}: {values[0]}")
+    except Exception:
+        pass
+
+    print()
+    print(" [Certificate Authority / Issuer]")
+
+    try:
+        from cryptography import x509
+        from cryptography.hazmat.backends import default_backend
+
+        cert = x509.load_der_x509_certificate(der_cert, default_backend())
+        issuer_fields = [
+            ("countryName", "countryName"),
+            ("organizationName", "organizationName"),
+            ("organizationalUnitName", "organizationalUnitName"),
+            ("commonName", "commonName"),
+        ]
+        for field_name, label in issuer_fields:
+            values = [attr.value for attr in cert.issuer if attr.oid._name == field_name]
+            if values:
+                print(f"  - {label}: {values[0]}")
+    except Exception:
+        pass
+
+    print()
+    print(" [OS Trust]")
+    trust_ok, trust_reason = assess_os_trust(hostname, port, starttls=starttls)
+    if trust_ok:
+        print("  - trustable by OS: yes")
+    else:
+        print("  - trustable by OS: no")
+        if trust_reason:
+            print(f"  - reason: {trust_reason}")
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Fetch and display TLS and DNS details for a host.")
     parser.add_argument(
@@ -50,6 +113,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--trace",
         action="store_true",
         help="Print trace logs while resolving and connecting.",
+    )
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Show the full certificate and DNS detail output instead of the compact jurisdiction-focused view.",
     )
     return parser
 
@@ -71,12 +139,19 @@ def main() -> int:
         if der is None or cert_dict is None or tls_ver is None or cipher is None:
             raise RuntimeError("TLS certificate retrieval did not return complete data")
 
-        display_cert_info(args.hostname, port, der, cert_dict, tls_ver, cipher, starttls=starttls_mode)
+        if args.full:
+            display_cert_info(args.hostname, port, der, cert_dict, tls_ver, cipher, starttls=starttls_mode)
+        else:
+            _display_compact_tls_summary(args.hostname, port, der, cert_dict, tls_ver, cipher, starttls=starttls_mode)
     except Exception as exc:
         print(f"\n[ERROR] Failed to retrieve TLS certificate: {exc}")
 
     try:
-        display_dns_report(args.hostname)
+        if args.full:
+            display_dns_report(args.hostname)
+        else:
+            print("DNS:")
+            display_dns_report(args.hostname, compact=True)
     except Exception as exc:
         trace(f"DNS summary failed: {exc}")
         print(f"\n[WARN] Failed to collect DNS summary: {exc}")
