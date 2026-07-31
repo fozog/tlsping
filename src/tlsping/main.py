@@ -18,6 +18,8 @@ PROTOCOL_PORTS = {
     "POP3": 995,
 }
 
+TRACE_ENABLED = False
+
 
 def resolve_port_spec(port_spec: Optional[str]) -> tuple[int, Optional[str]]:
     if port_spec is None:
@@ -34,6 +36,11 @@ def resolve_port_spec(port_spec: Optional[str]) -> tuple[int, Optional[str]]:
     valid = ", ".join(sorted(PROTOCOL_PORTS))
     raise ValueError(f"Unknown port/protocol '{port_spec}'. Use an integer or one of: {valid}")
 
+
+def set_trace_enabled(enabled: bool) -> None:
+    global TRACE_ENABLED
+    TRACE_ENABLED = enabled
+
 def parse_tuple_dict(tuples):
     """Utility to flatten Python's ssl certificate tuple structures."""
     out = {}
@@ -44,6 +51,8 @@ def parse_tuple_dict(tuples):
 
 
 def trace(message: str) -> None:
+    if not TRACE_ENABLED:
+        return
     print(f"[TRACE] {message}", file=sys.stderr, flush=True)
 
 
@@ -333,10 +342,18 @@ if __name__ == "__main__":
         "--port",
         dest="port_spec",
         metavar="[<port>|<NTS-KE>|<HTTPS>|<SMTP>|<SMTPS>|<IMAP>|<POP3>]",
+        default="HTTPS",
         help="Port number or protocol alias. Defaults to HTTPS. This probe is TCP/TLS only; no UDP support.",
+    )
+    parser.add_argument(
+        "--trace",
+        action="store_true",
+        help="Print trace logs while resolving and connecting.",
     )
 
     args = parser.parse_args()
+
+    set_trace_enabled(args.trace)
 
     try:
         port, starttls_mode = resolve_port_spec(args.port_spec)
