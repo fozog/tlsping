@@ -1,0 +1,15 @@
+Country|National Metrology Institute / Authority|Public NTP Hostname(s)|NTS Status
+Austria|BEV / ACOnet|time.univie.ac.at|Standard NTP
+Czech Republic|UFE / CESNET|tik.cesnet.cz,tak.cesnet.cz|Standard NTP
+Finland|VTT MIKES / CSC|time.mikes.fi,time1.mikes.fi|Standard NTP
+France|LNE-SYRTE / Observatoire de Paris|ntp-p1.obspm.fr, ntp.obspm.fr|Standard NTP
+France|RDEM Systems / Viarouge|ntp1.rdem-systems.com, ntp2.rdem-systems.com, ntp.viarouge.net|Fully Supported (NTS)
+Germany|PTB (Federal Institute)|ptbtime1.ptb.de,ptbtime2.ptb.de,ptbtime3.ptb.de,ptbtime4.ptb.de|Fully Supported (NTS)
+Germany|FAU Erlangen-Nürnberg|ntp3.fau.de,ntp3.ipv6.fau.de|Fully Supported (NTS)
+Italy|INRiM (Istituto Nazionale di Ricerca Metrologica)|ntp1.inrim.it,ntp2.inrim.it|Standard NTP
+Netherlands|VSL / SIDN|nts.time.nl,ntppool1.time.nl,ntppool2.time.nl|Fully Supported (NTS)
+Poland|GUM (Główny Urząd Miar)|tempus1.gum.gov.pl,tempus2.gum.gov.pl|Standard NTP
+Spain|ROA (Real Instituto y Observatorio de la Armada)|hora.roa.es|Standard NTP
+Sweden|RISE / Netnod|nts.netnod.se|Fully Supported (NTS)
+Switzerland|METAS / Community|ntp.3eck.net,ntp01.maillink.ch,ntp.zeitgitter.net|NTS Available
+United Kingdom|NPL (National Physical Laboratory)|ntp1.npl.co.uk,ntp2.npl.co.uk|Standard NTP

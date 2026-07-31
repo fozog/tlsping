@@ -1,0 +1,20 @@
+while IFS="" read -r p || [ -n "$p" ]
+do
+  OIF=$IFS
+  IFS='|' read -r -a element <<< "$p"
+  if [[ "${element[0]}" == "Country" ]]; then
+    continue
+  fi
+  echo "____________________________________________________"
+  printf '%s(%s)\n' "${element[0]}" "${element[1]}"
+  servers="${element[2]}"
+  IFS=',' read -r -a ntpsrvlist <<< "$servers"
+  #printf '   %s\n' "$servers"
+  for srv in "${ntpsrvlist[@]}"
+  do
+    echo "------------"
+    echo "    $srv"
+    PYTHONPATH=src .venv/bin/python -m tlsping.main --port NTS-KE $srv
+  done
+  IFS=$OIFS
+done < ntp.csv
