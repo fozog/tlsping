@@ -111,6 +111,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--trace",
+        "--traces",
+        dest="trace",
         action="store_true",
         help="Print trace logs while resolving and connecting.",
     )

@@ -1,5 +1,5 @@
-import builtins
 import unittest
+from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -28,40 +28,48 @@ class DnsCompatibilityTests(unittest.TestCase):
         self.assertIn(("example.com", "NS"), fake_resolver.calls)
 
     def test_nameserver_whois_fields_are_exposed(self) -> None:
-        with patch.object(dns_module.dns.resolver, "Resolver") as resolver_cls, patch.object(
+        class FakeResolver:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def resolve(self, domain: str, rdtype: str):
+                if domain == "example.com" and rdtype == "NS":
+                    return [SimpleNamespace(target=SimpleNamespace(to_text=lambda: "ns1.example.com."))]
+                raise AssertionError(f"unexpected lookup: {domain} {rdtype}")
+
+            def query(self, domain: str, rdtype: str):
+                raise AssertionError(f"query should not be used: {domain} {rdtype}")
+
+        fake_resolver = FakeResolver()
+
+        with patch.object(dns_module.dns.resolver, "Resolver", return_value=fake_resolver), patch.object(
             dns_module,
-            "_collect_whois_via_cli",
+            "_collect_whois_via_library",
             return_value=SimpleNamespace(descr="Netnod NDS Service", country="SE"),
         ):
-            resolver_cls.return_value.resolve.side_effect = [
-                [SimpleNamespace(target=SimpleNamespace(to_text=lambda: "ns1.example.com."))]
-            ]
             nameservers = dns_module._resolve_nameservers("example.com")
 
         self.assertEqual("Netnod NDS Service", nameservers[0].descr)
         self.assertEqual("SE", nameservers[0].country)
 
     def test_collect_dns_report_parses_registrar_blocks_and_record_maintained_by(self) -> None:
-        original_import = builtins.__import__
+        fake_whois_data = SimpleNamespace(
+            registrar=None,
+            country=None,
+            source=None,
+            text="Registrar:\n   Example Registrar\n   1 Main Street\n\nRecord maintained by: Example Registry\nCountry: SE\n",
+        )
 
-        def fake_import(name, *args, **kwargs):
-            if name == "whois":
-                raise ImportError("python-whois unavailable")
-            return original_import(name, *args, **kwargs)
-
-        with patch("builtins.__import__", side_effect=fake_import), patch.object(
-            dns_module.subprocess,
-            "run",
-            return_value=SimpleNamespace(
-                returncode=0,
-                stdout="Registrar:\n   Example Registrar\n   1 Main Street\nRecord maintained by: Example Registry\nCountry: SE\n",
-                stderr="",
-            ),
+        with patch.object(dns_module, "_query_rdap", return_value=None), patch.object(
+            dns_module,
+            "_query_whois",
+            return_value=fake_whois_data,
         ), patch.object(dns_module.dns.resolver, "Resolver") as resolver_cls:
             resolver_cls.return_value.resolve.side_effect = lambda *args, **kwargs: []
             report = dns_module.collect_dns_report("example.com")
 
         self.assertEqual("Example Registrar\n1 Main Street", report.registrar.registrar)
+        self.assertEqual("Example Registry", report.registrar.record_maintained_by)
         self.assertEqual("SE", report.registrar.country)
 
     def test_extract_from_raw_preserves_record_maintained_by(self) -> None:
@@ -73,49 +81,99 @@ class DnsCompatibilityTests(unittest.TestCase):
         self.assertEqual("Example Registry", parsed.record_maintained_by)
         self.assertEqual("SE", parsed.country)
 
-    def test_collect_dns_report_uses_cli_whois_fallback_for_record_maintained_by(self) -> None:
-        original_import = builtins.__import__
+    def test_extract_from_raw_sets_source_type(self) -> None:
+        parsed = dns_module._extract_from_raw("Registrar:\nExample Registrar\n")
 
-        def fake_import(name, *args, **kwargs):
-            if name == "whois":
-                raise ImportError("python-whois unavailable")
-            return original_import(name, *args, **kwargs)
+        self.assertEqual("WHOIS", parsed.source_type)
+        self.assertEqual("Example Registrar", parsed.registrar)
 
-        with patch("builtins.__import__", side_effect=fake_import), patch.object(
-            dns_module.subprocess,
-            "run",
-            return_value=SimpleNamespace(
-                returncode=0,
-                stdout="Registrar:\n   Example Registrar\nRecord maintained by: Example Registry\nCountry: SE\n",
-                stderr="",
-            ),
-        ), patch.object(dns_module.dns.resolver, "Resolver") as resolver_cls:
-            resolver_cls.return_value.resolve.side_effect = lambda *args, **kwargs: []
-            report = dns_module.collect_dns_report("example.com")
+    def test_extract_from_rdap_sets_source_type(self) -> None:
+        payload = {
+            "entities": [
+                {
+                    "roles": ["registrar"],
+                    "vcardArray": [[], ["fn", "Example Registrar"]],
+                }
+            ]
+        }
 
-        self.assertEqual("Example Registry", report.registrar.record_maintained_by)
+        parsed = dns_module._extract_from_rdap(payload)
 
-    def test_collect_dns_report_uses_cli_whois_fallback(self) -> None:
-        original_import = builtins.__import__
+        self.assertEqual("RDAP", parsed.source_type)
+        self.assertEqual("Example Registrar", parsed.registrar)
 
-        def fake_import(name, *args, **kwargs):
-            if name == "whois":
-                raise ImportError("python-whois unavailable")
-            return original_import(name, *args, **kwargs)
+    def test_extract_nameservers_from_rdap_payload(self) -> None:
+        payload = {
+            "nameservers": [
+                {"ldhName": "ns1.example.com"},
+                {"ldhName": "ns2.example.com"},
+            ]
+        }
 
-        with patch("builtins.__import__", side_effect=fake_import), patch.object(
-            dns_module.subprocess,
-            "run",
-            return_value=SimpleNamespace(
-                returncode=0,
-                stdout="Registrar: Example Registrar\nCountry: SE\n",
-                stderr="",
-            ),
+        nameservers = dns_module._extract_nameservers_from_rdap(payload)
+
+        self.assertEqual(["ns1.example.com", "ns2.example.com"], [ns.host for ns in nameservers])
+
+    def test_get_rdap_server_uses_iana_bootstrap(self) -> None:
+        class FakeResponse:
+            def __init__(self, payload: str) -> None:
+                self._payload = payload.encode("utf-8")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self) -> bytes:
+                return self._payload
+
+        bootstrap_payload = '{"services": [[ ["org"], ["https://rdap.publicinterestregistry.org/"] ]]}'
+
+        with patch.object(dns_module.urllib.request, "urlopen", return_value=FakeResponse(bootstrap_payload)):
+            server = dns_module._get_rdap_server("ietf.org")
+
+        self.assertEqual("https://rdap.publicinterestregistry.org/", server)
+
+    def test_get_rdap_server_matches_parent_domain_suffixes(self) -> None:
+        class FakeResponse:
+            def __init__(self, payload: str) -> None:
+                self._payload = payload.encode("utf-8")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self) -> bytes:
+                return self._payload
+
+        bootstrap_payload = '{"services": [[ ["com"], ["https://rdap.verisign.com/"] ]]}'
+
+        with patch.object(dns_module.urllib.request, "urlopen", return_value=FakeResponse(bootstrap_payload)):
+            server = dns_module._get_rdap_server("www.cisco.com")
+
+        self.assertEqual("https://rdap.verisign.com/", server)
+
+    def test_collect_dns_report_uses_library_whois_data(self) -> None:
+        fake_whois_data = SimpleNamespace(
+            registrar="Example Registrar",
+            country="SE",
+            source=None,
+            text="Registrar:\n   Example Registrar\n\nRecord maintained by: Example Registry\nCountry: SE\n",
+        )
+
+        with patch.object(dns_module, "_query_rdap", return_value=None), patch.object(
+            dns_module,
+            "_query_whois",
+            return_value=fake_whois_data,
         ), patch.object(dns_module.dns.resolver, "Resolver") as resolver_cls:
             resolver_cls.return_value.resolve.side_effect = lambda *args, **kwargs: []
             report = dns_module.collect_dns_report("example.com")
 
         self.assertEqual("Example Registrar", report.registrar.registrar)
+        self.assertEqual("Example Registry", report.registrar.record_maintained_by)
         self.assertEqual("SE", report.registrar.country)
         self.assertTrue(all("WHOIS" not in warning for warning in report.warnings))
 
@@ -138,14 +196,14 @@ class DnsCompatibilityTests(unittest.TestCase):
 
         fake_resolver = FakeResolver()
 
-        def fake_collect_whois(target: str):
+        def fake_collect_whois(target: str, use_rdap: bool = True):
             if target == "192.0.2.1":
                 return SimpleNamespace(descr="Netnod NDS Service", country="SE", registrar=None, source=None)
             return None
 
         with patch.object(dns_module.dns.resolver, "Resolver", return_value=fake_resolver), patch.object(
             dns_module,
-            "_collect_whois_via_cli",
+            "_collect_whois_via_library",
             side_effect=fake_collect_whois,
         ):
             nameservers = dns_module._resolve_nameservers("example.com")
@@ -153,3 +211,85 @@ class DnsCompatibilityTests(unittest.TestCase):
         self.assertEqual(1, len(nameservers))
         self.assertEqual("Netnod NDS Service", nameservers[0].descr)
         self.assertEqual("SE", nameservers[0].country)
+
+    def test_resolve_nameservers_does_not_query_rdap_for_metadata(self) -> None:
+        class FakeResolver:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def resolve(self, domain: str, rdtype: str):
+                if domain == "example.com" and rdtype == "NS":
+                    return [SimpleNamespace(target=SimpleNamespace(to_text=lambda: "ns1.example.com."))]
+                if domain == "ns1.example.com" and rdtype == "A":
+                    return [SimpleNamespace(address="192.0.2.1")]
+                if domain == "ns1.example.com" and rdtype == "AAAA":
+                    return []
+                raise AssertionError(f"unexpected lookup: {domain} {rdtype}")
+
+            def query(self, domain: str, rdtype: str):
+                raise AssertionError(f"query should not be used: {domain} {rdtype}")
+
+        fake_resolver = FakeResolver()
+
+        with patch.object(dns_module.dns.resolver, "Resolver", return_value=fake_resolver), patch.object(
+            dns_module,
+            "_query_rdap",
+            side_effect=AssertionError("RDAP should not be used for nameserver metadata"),
+        ), patch.object(
+            dns_module,
+            "_query_whois",
+            return_value="descr: Netnod NDS Service\nCountry: SE\n",
+        ):
+            nameservers = dns_module._resolve_nameservers("example.com")
+
+        self.assertEqual(1, len(nameservers))
+        self.assertEqual("Netnod NDS Service", nameservers[0].descr)
+        self.assertEqual("SE", nameservers[0].country)
+
+    def test_resolve_nameservers_uses_only_ns_host_and_ips_for_whois_metadata(self) -> None:
+        class FakeResolver:
+            def resolve(self, domain: str, rdtype: str):
+                if domain == "example.com" and rdtype == "NS":
+                    return [SimpleNamespace(target=SimpleNamespace(to_text=lambda: "ns1.example.com."))]
+                if domain == "ns1.example.com" and rdtype == "A":
+                    return [SimpleNamespace(address="192.0.2.1")]
+                if domain == "ns1.example.com" and rdtype == "AAAA":
+                    return []
+                raise AssertionError(f"unexpected lookup: {domain} {rdtype}")
+
+            def query(self, domain: str, rdtype: str):
+                raise AssertionError(f"query should not be used: {domain} {rdtype}")
+
+        fake_resolver = FakeResolver()
+        seen_targets = []
+
+        def fake_collect_whois(target: str, use_rdap: bool = True):
+            seen_targets.append((target, use_rdap))
+            return None
+
+        with patch.object(dns_module.dns.resolver, "Resolver", return_value=fake_resolver), patch.object(
+            dns_module,
+            "_collect_whois_via_library",
+            side_effect=fake_collect_whois,
+        ):
+            dns_module._resolve_nameservers("example.com")
+
+        self.assertEqual([("ns1.example.com", False), ("192.0.2.1", False)], seen_targets)
+
+    def test_collect_dns_report_stores_rdap_nameservers(self) -> None:
+        rdap_payload = {
+            "nameservers": [
+                {"ldhName": "ns1.example.com"},
+                {"ldhName": "ns2.example.com"},
+            ]
+        }
+
+        with patch.object(dns_module, "_query_rdap", return_value=rdap_payload), patch.object(
+            dns_module,
+            "_collect_whois_via_library",
+            return_value=None,
+        ), patch.object(dns_module.dns.resolver, "Resolver") as resolver_cls:
+            resolver_cls.return_value.resolve.side_effect = lambda *args, **kwargs: []
+            report = dns_module.collect_dns_report("example.com")
+
+        self.assertEqual(["ns1.example.com", "ns2.example.com"], [ns.host for ns in report.rdap_nameservers])

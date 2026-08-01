@@ -1,10 +1,14 @@
 from __future__ import annotations
 
-import subprocess
+import json
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, List, Optional
 
 import dns.resolver
+
+from .tls import trace
 
 
 @dataclass
@@ -14,6 +18,7 @@ class RegistrarInfo:
     country: Optional[str] = None
     descr: Optional[str] = None
     record_maintained_by: Optional[str] = None
+    source_type: Optional[str] = None
 
 
 @dataclass
@@ -29,6 +34,7 @@ class DnsReport:
     domain: str
     registrar: RegistrarInfo
     nameservers: List[NameserverInfo]
+    rdap_nameservers: List[NameserverInfo]
     warnings: List[str]
 
 
@@ -67,7 +73,7 @@ def _first_ns_domain(hostname: str) -> str:
 
 
 def _extract_from_raw(raw_text: str) -> RegistrarInfo:
-    registrar_info = RegistrarInfo()
+    registrar_info = RegistrarInfo(source_type="WHOIS")
 
     if not raw_text:
         return registrar_info
@@ -161,9 +167,139 @@ def _to_scalar(value) -> Optional[str]:
     return str(value)
 
 
+def _get_whois_value(whois_data: Any, attr: str) -> Any:
+    if hasattr(whois_data, attr):
+        return getattr(whois_data, attr)
+    if isinstance(whois_data, dict):
+        return whois_data.get(attr)
+    return None
+
+
+def _get_rdap_server(domain: str) -> Optional[str]:
+    bootstrap_url = "https://data.iana.org/rdap/dns.json"
+    try:
+        with urllib.request.urlopen(bootstrap_url, timeout=10) as response:
+            payload = response.read().decode("utf-8")
+    except Exception:
+        return None
+
+    try:
+        bootstrap = json.loads(payload)
+    except Exception:
+        return None
+
+    labels = [label for label in domain.strip(".").split(".") if label]
+    suffixes = [".".join(labels[index:]) for index in range(len(labels))]
+    for suffix in suffixes:
+        for service in bootstrap.get("services", []):
+            if not service or len(service) < 2:
+                continue
+            tlds = service[0] or []
+            if not isinstance(tlds, list):
+                continue
+            tld_values = {str(tld).lower() for tld in tlds if isinstance(tld, str)}
+            if suffix.lower() in tld_values:
+                urls = service[1] or []
+                if isinstance(urls, list) and urls:
+                    first_url = next((url for url in urls if isinstance(url, str) and url), None)
+                    if first_url:
+                        return first_url.rstrip("/") + "/"
+    return None
+
+
+def _query_rdap(domain: str) -> Optional[dict]:
+    candidates = []
+    server = _get_rdap_server(domain)
+    if server:
+        candidates.append(server.rstrip("/") + "/")
+    candidates.extend(["https://rdap.org/", "https://rdap.publicinterestregistry.org/"])
+
+    for base_url in candidates:
+        endpoint_path = f"{base_url.rstrip('/')}/domain/{urllib.parse.quote(domain, safe='.') }"
+        trace(f"querying RDAP: {endpoint_path}")
+        try:
+            with urllib.request.urlopen(endpoint_path, timeout=10) as response:
+                payload = response.read().decode("utf-8")
+        except Exception as exc:
+            trace(f"RDAP lookup failed for {endpoint_path}: {exc}")
+            continue
+
+        try:
+            parsed = json.loads(payload)
+        except Exception as exc:
+            trace(f"RDAP response was not valid JSON for {endpoint_path}: {exc}")
+            continue
+
+        if parsed:
+            trace(f"RDAP response received for {endpoint_path}")
+            return parsed
+        trace(f"RDAP response empty for {endpoint_path}")
+
+    trace("RDAP lookup produced no usable response")
+    return None
+
+
+def _extract_nameservers_from_rdap(payload: Optional[dict]) -> List[NameserverInfo]:
+    if not payload:
+        return []
+
+    nameservers = payload.get("nameservers") or []
+    if not isinstance(nameservers, list) or not nameservers:
+        return []
+
+    result: List[NameserverInfo] = []
+    for entry in nameservers:
+        if not isinstance(entry, dict):
+            continue
+        host = entry.get("ldhName") or entry.get("unicodeName") or entry.get("name")
+        if host:
+            result.append(NameserverInfo(host=str(host), addresses=[]))
+            trace(f"RDAP nameserver: {host}")
+    return result
+
+
+def _extract_from_rdap(payload: Optional[dict]) -> RegistrarInfo:
+    registrar_info = RegistrarInfo(source_type="RDAP")
+    if not payload:
+        return registrar_info
+
+    entities = payload.get("entities") or []
+    for entity in entities:
+        if not isinstance(entity, dict):
+            continue
+        if entity.get("roles") and "registrar" in [role.lower() for role in entity.get("roles", [])]:
+            vcard = entity.get("vcardArray") or []
+            if isinstance(vcard, list):
+                for entry in vcard:
+                    if not isinstance(entry, list):
+                        continue
+                    if not entry:
+                        continue
+                    if len(entry) >= 4 and isinstance(entry[0], str) and entry[0].lower() in {"fn", "org"}:
+                        registrar_info.registrar = _to_scalar(entry[3])
+                        break
+                    if len(entry) >= 2 and isinstance(entry[1], list):
+                        nested = entry[1]
+                        if nested and len(nested) >= 4 and isinstance(nested[0], str) and nested[0].lower() in {"fn", "org"}:
+                            registrar_info.registrar = _to_scalar(nested[3])
+                            break
+                    if len(entry) >= 2 and isinstance(entry[0], str) and entry[0].lower() in {"fn", "org"}:
+                        registrar_info.registrar = _to_scalar(entry[1])
+                        break
+            break
+
+    if not registrar_info.registrar:
+        registrar_info.registrar = _to_scalar(payload.get("handle"))
+
+    return registrar_info
+
+
 def _resolve_nameservers(domain: str) -> List[NameserverInfo]:
     resolver = dns.resolver.Resolver()
 
+    # Use the DNS NS records for the authoritative nameserver list and enrich
+    # them with WHOIS metadata when available. RDAP is still used for the
+    # domain registrar lookup, but not for nameserver metadata probing.
     ns_hosts: List[str] = []
     try:
         answer = _query_resolver(resolver, domain, "NS")
@@ -196,11 +332,13 @@ def _resolve_nameservers(domain: str) -> List[NameserverInfo]:
             pass
 
         whois_info = None
-        lookup_targets = [host, host.split(".", 1)[-1], domain]
+        lookup_targets = [host]
         lookup_targets.extend(addresses)
         for candidate in lookup_targets:
-            whois_info = _collect_whois_via_cli(candidate)
+            trace(f"checking WHOIS metadata for nameserver candidate {candidate}")
+            whois_info = _collect_whois_via_library(candidate, use_rdap=False)
             if whois_info and (whois_info.descr or whois_info.country):
+                trace(f"WHOIS nameserver metadata found for {candidate}: descr={whois_info.descr or 'N/A'} country={whois_info.country or 'N/A'}")
                 break
 
         results.append(
@@ -215,22 +353,39 @@ def _resolve_nameservers(domain: str) -> List[NameserverInfo]:
     return results
 
 
-def _collect_whois_via_cli(domain: str) -> Optional[RegistrarInfo]:
-    try:
-        completed = subprocess.run(
-            ["whois", domain],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return None
+def _query_whois(domain: str) -> Any:
+    import subprocess
 
+    trace(f"querying WHOIS for {domain}")
+    completed = subprocess.run(
+        ["whois", domain],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
     if not completed.stdout and not completed.stderr:
+        raise RuntimeError("empty whois output")
+    return "\n".join(part for part in [completed.stdout, completed.stderr] if part)
+
+
+def _collect_whois_via_library(domain: str, use_rdap: bool = True) -> Optional[RegistrarInfo]:
+    if use_rdap:
+        rdap_payload = _query_rdap(domain)
+        rdap_info = _extract_from_rdap(rdap_payload)
+
+        if rdap_info.registrar:
+            return rdap_info
+
+    try:
+        raw_text = _query_whois(domain)
+    except Exception as exc:
+        trace(f"WHOIS lookup failed for {domain}: {exc}")
         return None
 
-    raw_text = "\n".join(part for part in [completed.stdout, completed.stderr] if part)
+    if not isinstance(raw_text, str):
+        raw_text = getattr(raw_text, "text", "") or ""
+
     parsed = _extract_from_raw(raw_text)
     if parsed.registrar or parsed.source or parsed.country or parsed.record_maintained_by:
         return parsed
@@ -242,52 +397,26 @@ def collect_dns_report(hostname: str) -> DnsReport:
     warnings: List[str] = []
 
     registrar = RegistrarInfo()
-    try:
-        import whois  # type: ignore
+    library_whois = _collect_whois_via_library(domain)
+    if library_whois:
+        registrar = library_whois
+    else:
+        warnings.append("WHOIS lookup unavailable; registrar metadata unavailable")
 
-        whois_data = whois.whois(domain)
-        registrar.registrar = _to_scalar(getattr(whois_data, "registrar", None) or whois_data.get("registrar"))
-        registrar.country = _to_scalar(getattr(whois_data, "country", None) or whois_data.get("country"))
-        registrar.source = _to_scalar(getattr(whois_data, "source", None) or whois_data.get("source"))
-        registrar.record_maintained_by = _to_scalar(
-            getattr(whois_data, "record_maintained_by", None) or whois_data.get("record_maintained_by")
-        )
-
-        raw_text = getattr(whois_data, "text", None) or whois_data.get("text") or ""
-        parsed = _extract_from_raw(raw_text if isinstance(raw_text, str) else "")
-
-        if not registrar.registrar:
-            registrar.registrar = parsed.registrar
-        if not registrar.source:
-            registrar.source = parsed.source
-        if not registrar.country:
-            registrar.country = parsed.country
-        if not registrar.record_maintained_by:
-            registrar.record_maintained_by = parsed.record_maintained_by
-
-    except Exception:
-        cli_whois = _collect_whois_via_cli(domain)
-        if cli_whois:
-            registrar = cli_whois
-        else:
-            warnings.append("WHOIS lookup unavailable; registrar metadata unavailable")
-
-    if not registrar.record_maintained_by:
-        cli_whois = _collect_whois_via_cli(domain)
-        if cli_whois:
-            registrar.record_maintained_by = cli_whois.record_maintained_by
-            if not registrar.registrar:
-                registrar.registrar = cli_whois.registrar
-            if not registrar.source:
-                registrar.source = cli_whois.source
-            if not registrar.country:
-                registrar.country = cli_whois.country
+    rdap_payload = _query_rdap(domain)
+    rdap_nameservers = _extract_nameservers_from_rdap(rdap_payload)
 
     nameservers = _resolve_nameservers(domain)
     if not nameservers:
         warnings.append("authoritative nameserver lookup returned no NS records")
 
-    return DnsReport(domain=domain, registrar=registrar, nameservers=nameservers, warnings=warnings)
+    return DnsReport(
+        domain=domain,
+        registrar=registrar,
+        nameservers=nameservers,
+        rdap_nameservers=rdap_nameservers,
+        warnings=warnings,
+    )
 
 
 def display_dns_report(hostname: str, compact: bool = False) -> None:
@@ -295,10 +424,10 @@ def display_dns_report(hostname: str, compact: bool = False) -> None:
 
     if compact:
         print(" [Registrar]")
-        print(f"  - registrar : {report.registrar.registrar or 'N/A'}")
-        print(f"  - record maintained by : {report.registrar.record_maintained_by or 'N/A'}")
-        print(f"  - source    : {report.registrar.source or 'N/A'}")
-        print(f"  - country   : {report.registrar.country or 'N/A'}")
+        if report.registrar.registrar:
+            print(f"  - name   : {report.registrar.registrar}")
+        if report.registrar.record_maintained_by:
+            print(f"  - record maintained by : {report.registrar.record_maintained_by}")
 
         print("\n [Authoritative Nameservers]")
         if report.nameservers:
@@ -319,12 +448,18 @@ def display_dns_report(hostname: str, compact: bool = False) -> None:
     print(f"Domain used      : {report.domain}")
 
     print("\n [Registrar]")
-    print(f"  - registrar : {report.registrar.registrar or 'N/A'}")
-    print(
-        f"  - record maintained by : {report.registrar.record_maintained_by or 'N/A'}"
-    )
-    print(f"  - source    : {report.registrar.source or 'N/A'}")
-    print(f"  - country   : {report.registrar.country or 'N/A'}")
+    if report.registrar.source_type:
+        print(f"  - source type : {report.registrar.source_type}")
+    if report.registrar.registrar:
+        print(f"  - registrar   : {report.registrar.registrar}")
+    if report.registrar.record_maintained_by:
+        print(
+            f"  - record maintained by : {report.registrar.record_maintained_by}"
+        )
+    if report.registrar.source:
+        print(f"  - source      : {report.registrar.source}")
+    if report.registrar.country:
+        print(f"  - country     : {report.registrar.country}")
 
     print("\n [Authoritative Nameservers]")
     if report.nameservers:
@@ -335,6 +470,7 @@ def display_dns_report(hostname: str, compact: bool = False) -> None:
             print(f"  - {ns.host}: {joined_ips}{descr}{country}")
     else:
         print("  - N/A")
+
 
     if report.warnings:
         print("\n [DNS Warnings]")
