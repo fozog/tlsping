@@ -184,14 +184,6 @@ def _to_scalar(value) -> Optional[str]:
     return str(value)
 
 
-def _get_whois_value(whois_data: Any, attr: str) -> Any:
-    if hasattr(whois_data, attr):
-        return getattr(whois_data, attr)
-    if isinstance(whois_data, dict):
-        return whois_data.get(attr)
-    return None
-
-
 def _get_rdap_server(domain: str) -> Optional[str]:
     bootstrap_url = "https://data.iana.org/rdap/dns.json"
     try:
@@ -436,7 +428,7 @@ def _collect_whois_metadata(ip_address: str) -> Optional[dict]:
     return result
 
 
-def _collect_whois_via_library(domain: str, use_rdap: bool = True) -> Optional[RegistrarInfo]:
+def _collect_registrar_info(domain: str, use_rdap: bool = True) -> Optional[RegistrarInfo]:
     if use_rdap:
         rdap_payload = _query_rdap(domain)
         rdap_info = _extract_from_rdap(rdap_payload)
@@ -464,9 +456,9 @@ def collect_dns_report(hostname: str) -> DnsReport:
     warnings: List[str] = []
 
     registrar = RegistrarInfo()
-    library_whois = _collect_whois_via_library(domain)
-    if library_whois:
-        registrar = library_whois
+    registrar_info = _collect_registrar_info(domain)
+    if registrar_info:
+        registrar = registrar_info
     else:
         warnings.append("WHOIS lookup unavailable; registrar metadata unavailable")
 
@@ -482,6 +474,30 @@ def collect_dns_report(hostname: str) -> DnsReport:
     )
 
 
+def _format_nameserver_compact(ns: NameserverInfo) -> str:
+    parts = [ns.host.rstrip(".")]
+    if ns.descr:
+        parts.append(f"descr: {ns.descr}")
+    if ns.country:
+        parts.append(f"country: {ns.country}")
+    if ns.asn:
+        parts.append(f"asn: {ns.asn}")
+    return " | ".join(parts)
+
+
+def _format_nameserver_full(ns: NameserverInfo) -> str:
+    joined_ips = ", ".join(ns.addresses) if ns.addresses else "N/A"
+    details = []
+    if ns.descr:
+        details.append(f"descr: {ns.descr}")
+    if ns.country:
+        details.append(f"country: {ns.country}")
+    if ns.asn:
+        details.append(f"asn: {ns.asn}")
+    suffix = f" | {' | '.join(details)}" if details else ""
+    return f"{ns.host.rstrip('.')}: {joined_ips}{suffix}"
+
+
 def display_dns_report(hostname: str, compact: bool = False) -> None:
     report = collect_dns_report(hostname)
 
@@ -495,14 +511,7 @@ def display_dns_report(hostname: str, compact: bool = False) -> None:
         print("\n [Authoritative Nameservers]")
         if report.nameservers:
             for ns in report.nameservers:
-                parts = [ns.host.rstrip(".")]
-                if ns.descr:
-                    parts.append(f"descr: {ns.descr}")
-                if ns.country:
-                    parts.append(f"country: {ns.country}")
-                if ns.asn:
-                    parts.append(f"asn: {ns.asn}")
-                print(f"  - {' | '.join(parts)}")
+                print(f"  - {_format_nameserver_compact(ns)}")
         else:
             print("  - N/A")
         return
@@ -529,14 +538,9 @@ def display_dns_report(hostname: str, compact: bool = False) -> None:
     print("\n [Authoritative Nameservers]")
     if report.nameservers:
         for ns in report.nameservers:
-            joined_ips = ", ".join(ns.addresses) if ns.addresses else "N/A"
-            descr = f" | descr: {ns.descr}" if ns.descr else ""
-            country = f" | country: {ns.country}" if ns.country else ""
-            asn = f" | asn: {ns.asn}" if ns.asn else ""
-            print(f"  - {ns.host}: {joined_ips}{descr}{country}{asn}")
+            print(f"  - {_format_nameserver_full(ns)}")
     else:
         print("  - N/A")
-
 
     if report.warnings:
         print("\n [DNS Warnings]")
