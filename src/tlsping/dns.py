@@ -34,7 +34,6 @@ class DnsReport:
     domain: str
     registrar: RegistrarInfo
     nameservers: List[NameserverInfo]
-    rdap_nameservers: List[NameserverInfo]
     warnings: List[str]
 
 
@@ -239,25 +238,6 @@ def _query_rdap(domain: str) -> Optional[dict]:
     return None
 
 
-def _extract_nameservers_from_rdap(payload: Optional[dict]) -> List[NameserverInfo]:
-    if not payload:
-        return []
-
-    nameservers = payload.get("nameservers") or []
-    if not isinstance(nameservers, list) or not nameservers:
-        return []
-
-    result: List[NameserverInfo] = []
-    for entry in nameservers:
-        if not isinstance(entry, dict):
-            continue
-        host = entry.get("ldhName") or entry.get("unicodeName") or entry.get("name")
-        if host:
-            result.append(NameserverInfo(host=str(host), addresses=[]))
-            trace(f"RDAP nameserver: {host}")
-    return result
-
-
 def _extract_from_rdap(payload: Optional[dict]) -> RegistrarInfo:
     registrar_info = RegistrarInfo(source_type="RDAP")
     if not payload:
@@ -403,9 +383,6 @@ def collect_dns_report(hostname: str) -> DnsReport:
     else:
         warnings.append("WHOIS lookup unavailable; registrar metadata unavailable")
 
-    rdap_payload = _query_rdap(domain)
-    rdap_nameservers = _extract_nameservers_from_rdap(rdap_payload)
-
     nameservers = _resolve_nameservers(domain)
     if not nameservers:
         warnings.append("authoritative nameserver lookup returned no NS records")
@@ -414,7 +391,6 @@ def collect_dns_report(hostname: str) -> DnsReport:
         domain=domain,
         registrar=registrar,
         nameservers=nameservers,
-        rdap_nameservers=rdap_nameservers,
         warnings=warnings,
     )
 

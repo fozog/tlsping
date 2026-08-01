@@ -102,18 +102,6 @@ class DnsCompatibilityTests(unittest.TestCase):
         self.assertEqual("RDAP", parsed.source_type)
         self.assertEqual("Example Registrar", parsed.registrar)
 
-    def test_extract_nameservers_from_rdap_payload(self) -> None:
-        payload = {
-            "nameservers": [
-                {"ldhName": "ns1.example.com"},
-                {"ldhName": "ns2.example.com"},
-            ]
-        }
-
-        nameservers = dns_module._extract_nameservers_from_rdap(payload)
-
-        self.assertEqual(["ns1.example.com", "ns2.example.com"], [ns.host for ns in nameservers])
-
     def test_get_rdap_server_uses_iana_bootstrap(self) -> None:
         class FakeResponse:
             def __init__(self, payload: str) -> None:
@@ -276,20 +264,3 @@ class DnsCompatibilityTests(unittest.TestCase):
 
         self.assertEqual([("ns1.example.com", False), ("192.0.2.1", False)], seen_targets)
 
-    def test_collect_dns_report_stores_rdap_nameservers(self) -> None:
-        rdap_payload = {
-            "nameservers": [
-                {"ldhName": "ns1.example.com"},
-                {"ldhName": "ns2.example.com"},
-            ]
-        }
-
-        with patch.object(dns_module, "_query_rdap", return_value=rdap_payload), patch.object(
-            dns_module,
-            "_collect_whois_via_library",
-            return_value=None,
-        ), patch.object(dns_module.dns.resolver, "Resolver") as resolver_cls:
-            resolver_cls.return_value.resolve.side_effect = lambda *args, **kwargs: []
-            report = dns_module.collect_dns_report("example.com")
-
-        self.assertEqual(["ns1.example.com", "ns2.example.com"], [ns.host for ns in report.rdap_nameservers])
