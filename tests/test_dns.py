@@ -27,7 +27,7 @@ class DnsCompatibilityTests(unittest.TestCase):
         self.assertEqual(["ns1.example.com"], [ns.host for ns in nameservers])
         self.assertIn(("example.com", "NS"), fake_resolver.calls)
 
-    def test_nameserver_whois_fields_are_exposed(self) -> None:
+    def test_nameserver_cymru_fields_are_exposed(self) -> None:
         class FakeResolver:
             def __init__(self) -> None:
                 self.calls = []
@@ -35,6 +35,10 @@ class DnsCompatibilityTests(unittest.TestCase):
             def resolve(self, domain: str, rdtype: str):
                 if domain == "example.com" and rdtype == "NS":
                     return [SimpleNamespace(target=SimpleNamespace(to_text=lambda: "ns1.example.com."))]
+                if domain == "ns1.example.com" and rdtype == "A":
+                    return [SimpleNamespace(address="192.0.2.1")]
+                if domain == "ns1.example.com" and rdtype == "AAAA":
+                    return []
                 raise AssertionError(f"unexpected lookup: {domain} {rdtype}")
 
             def query(self, domain: str, rdtype: str):
@@ -44,12 +48,12 @@ class DnsCompatibilityTests(unittest.TestCase):
 
         with patch.object(dns_module.dns.resolver, "Resolver", return_value=fake_resolver), patch.object(
             dns_module,
-            "_collect_whois_via_library",
-            return_value=SimpleNamespace(descr="Netnod NDS Service", country="SE"),
+            "_collect_cymru_metadata",
+            return_value={"asn": "AS12345", "country": "SE"},
         ):
             nameservers = dns_module._resolve_nameservers("example.com")
 
-        self.assertEqual("Netnod NDS Service", nameservers[0].descr)
+        self.assertEqual("AS12345", nameservers[0].asn)
         self.assertEqual("SE", nameservers[0].country)
 
     def test_collect_dns_report_parses_registrar_blocks_and_record_maintained_by(self) -> None:
@@ -165,7 +169,7 @@ class DnsCompatibilityTests(unittest.TestCase):
         self.assertEqual("SE", report.registrar.country)
         self.assertTrue(all("WHOIS" not in warning for warning in report.warnings))
 
-    def test_resolve_nameservers_uses_ip_whois_metadata(self) -> None:
+    def test_resolve_nameservers_uses_cymru_metadata(self) -> None:
         class FakeResolver:
             def __init__(self) -> None:
                 self.calls = []
@@ -184,20 +188,20 @@ class DnsCompatibilityTests(unittest.TestCase):
 
         fake_resolver = FakeResolver()
 
-        def fake_collect_whois(target: str, use_rdap: bool = True):
+        def fake_collect_cymru(target: str):
             if target == "192.0.2.1":
-                return SimpleNamespace(descr="Netnod NDS Service", country="SE", registrar=None, source=None)
+                return {"asn": "AS12345", "country": "SE"}
             return None
 
         with patch.object(dns_module.dns.resolver, "Resolver", return_value=fake_resolver), patch.object(
             dns_module,
-            "_collect_whois_via_library",
-            side_effect=fake_collect_whois,
+            "_collect_cymru_metadata",
+            side_effect=fake_collect_cymru,
         ):
             nameservers = dns_module._resolve_nameservers("example.com")
 
         self.assertEqual(1, len(nameservers))
-        self.assertEqual("Netnod NDS Service", nameservers[0].descr)
+        self.assertEqual("AS12345", nameservers[0].asn)
         self.assertEqual("SE", nameservers[0].country)
 
     def test_resolve_nameservers_does_not_query_rdap_for_metadata(self) -> None:
@@ -225,14 +229,46 @@ class DnsCompatibilityTests(unittest.TestCase):
             side_effect=AssertionError("RDAP should not be used for nameserver metadata"),
         ), patch.object(
             dns_module,
-            "_query_whois",
-            return_value="descr: Netnod NDS Service\nCountry: SE\n",
+            "_collect_cymru_metadata",
+            return_value={"asn": "AS12345", "country": "SE"},
         ):
             nameservers = dns_module._resolve_nameservers("example.com")
 
         self.assertEqual(1, len(nameservers))
-        self.assertEqual("Netnod NDS Service", nameservers[0].descr)
+        self.assertEqual("AS12345", nameservers[0].asn)
         self.assertEqual("SE", nameservers[0].country)
+
+    def test_resolve_nameservers_falls_back_to_whois_when_cymru_fails(self) -> None:
+        class FakeResolver:
+            def resolve(self, domain: str, rdtype: str):
+                if domain == "example.com" and rdtype == "NS":
+                    return [SimpleNamespace(target=SimpleNamespace(to_text=lambda: "ns1.example.com."))]
+                if domain == "ns1.example.com" and rdtype == "A":
+                    return [SimpleNamespace(address="192.0.2.1")]
+                if domain == "ns1.example.com" and rdtype == "AAAA":
+                    return []
+                raise AssertionError(f"unexpected lookup: {domain} {rdtype}")
+
+            def query(self, domain: str, rdtype: str):
+                raise AssertionError(f"query should not be used: {domain} {rdtype}")
+
+        fake_resolver = FakeResolver()
+
+        with patch.object(dns_module.dns.resolver, "Resolver", return_value=fake_resolver), patch.object(
+            dns_module,
+            "_collect_cymru_metadata",
+            return_value=None,
+        ), patch.object(
+            dns_module,
+            "_collect_whois_metadata",
+            return_value={"country": "SE", "descr": "Netnod"},
+        ):
+            nameservers = dns_module._resolve_nameservers("example.com")
+
+        self.assertEqual(1, len(nameservers))
+        self.assertEqual("SE", nameservers[0].country)
+        self.assertEqual("Netnod", nameservers[0].descr)
+        self.assertIsNone(nameservers[0].asn)
 
     def test_resolve_nameservers_uses_only_ns_host_and_ips_for_whois_metadata(self) -> None:
         class FakeResolver:
@@ -251,16 +287,16 @@ class DnsCompatibilityTests(unittest.TestCase):
         fake_resolver = FakeResolver()
         seen_targets = []
 
-        def fake_collect_whois(target: str, use_rdap: bool = True):
-            seen_targets.append((target, use_rdap))
+        def fake_collect_cymru(target: str):
+            seen_targets.append(target)
             return None
 
         with patch.object(dns_module.dns.resolver, "Resolver", return_value=fake_resolver), patch.object(
             dns_module,
-            "_collect_whois_via_library",
-            side_effect=fake_collect_whois,
+            "_collect_cymru_metadata",
+            side_effect=fake_collect_cymru,
         ):
             dns_module._resolve_nameservers("example.com")
 
-        self.assertEqual([("ns1.example.com", False), ("192.0.2.1", False)], seen_targets)
+        self.assertEqual(["192.0.2.1"], seen_targets)
 

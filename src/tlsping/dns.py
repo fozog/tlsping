@@ -27,6 +27,7 @@ class NameserverInfo:
     addresses: List[str]
     descr: Optional[str] = None
     country: Optional[str] = None
+    asn: Optional[str] = None
 
 
 @dataclass
@@ -69,6 +70,23 @@ def _first_ns_domain(hostname: str) -> str:
         except Exception:
             continue
     return hostname.strip(".")
+
+
+def _answer_texts(answer: Any) -> List[str]:
+    if not answer:
+        return []
+
+    values: List[str] = []
+    for record in answer:
+        if hasattr(record, "target") and hasattr(record.target, "to_text"):
+            values.append(record.target.to_text().rstrip("."))
+        elif hasattr(record, "to_text"):
+            values.append(record.to_text().rstrip("."))
+        elif hasattr(record, "address"):
+            values.append(record.address)
+        else:
+            values.append(str(record).rstrip("."))
+    return values
 
 
 def _extract_from_raw(raw_text: str) -> RegistrarInfo:
@@ -277,56 +295,66 @@ def _extract_from_rdap(payload: Optional[dict]) -> RegistrarInfo:
 def _resolve_nameservers(domain: str) -> List[NameserverInfo]:
     resolver = dns.resolver.Resolver()
 
-    # Use the DNS NS records for the authoritative nameserver list and enrich
-    # them with WHOIS metadata when available. RDAP is still used for the
-    # domain registrar lookup, but not for nameserver metadata probing.
     ns_hosts: List[str] = []
     try:
+        trace(f"querying NS records for {domain} via resolver")
         answer = _query_resolver(resolver, domain, "NS")
-        ns_hosts = [
-            record.target.to_text().rstrip(".") if hasattr(record.target, "to_text") else str(record.target).rstrip(".")
-            for record in answer
-        ]
-    except Exception:
+        ns_hosts = _answer_texts(answer)
+        trace(f"resolver returned NS results for {domain}: {ns_hosts or '<none>'}")
+    except Exception as exc:
+        trace(f"NS query failed for {domain}: {exc}")
         return []
 
     results: List[NameserverInfo] = []
     for host in sorted(set(ns_hosts)):
         addresses: List[str] = []
         try:
+            trace(f"querying A records for nameserver {host}")
             a_records = _query_resolver(resolver, host, "A")
-            addresses.extend(
-                record.address if hasattr(record, "address") else str(record)
-                for record in a_records
-            )
-        except Exception:
+            addresses.extend(_answer_texts(a_records))
+            trace(f"A record results for {host}: {addresses or '<none>'}")
+        except Exception as exc:
+            trace(f"A lookup failed for {host}: {exc}")
             pass
 
         try:
+            trace(f"querying AAAA records for nameserver {host}")
             aaaa_records = _query_resolver(resolver, host, "AAAA")
-            addresses.extend(
-                record.address if hasattr(record, "address") else str(record)
-                for record in aaaa_records
-            )
-        except Exception:
+            addresses.extend(_answer_texts(aaaa_records))
+            trace(f"AAAA record results for {host}: {addresses or '<none>'}")
+        except Exception as exc:
+            trace(f"AAAA lookup failed for {host}: {exc}")
             pass
 
-        whois_info = None
-        lookup_targets = [host]
-        lookup_targets.extend(addresses)
-        for candidate in lookup_targets:
-            trace(f"checking WHOIS metadata for nameserver candidate {candidate}")
-            whois_info = _collect_whois_via_library(candidate, use_rdap=False)
-            if whois_info and (whois_info.descr or whois_info.country):
-                trace(f"WHOIS nameserver metadata found for {candidate}: descr={whois_info.descr or 'N/A'} country={whois_info.country or 'N/A'}")
+        metadata: Optional[dict] = None
+        for candidate in addresses:
+            trace(f"checking Cymru metadata for nameserver IP {candidate}")
+            cymru_data = _collect_cymru_metadata(candidate)
+            if cymru_data and (cymru_data.get("country") or cymru_data.get("asn")):
+                metadata = cymru_data
+                trace(
+                    f"Cymru nameserver metadata found for {candidate}: "
+                    f"asn={cymru_data.get('asn') or 'N/A'} country={cymru_data.get('country') or 'N/A'}"
+                )
+                break
+
+            trace(f"Cymru metadata unavailable for {candidate}; trying WHOIS fallback")
+            whois_data = _collect_whois_metadata(candidate)
+            if whois_data:
+                metadata = {"country": whois_data.get("country"), "descr": whois_data.get("descr"), "asn": None}
+                trace(
+                    f"WHOIS nameserver metadata found for {candidate}: "
+                    f"country={metadata.get('country') or 'N/A'} descr={metadata.get('descr') or 'N/A'}"
+                )
                 break
 
         results.append(
             NameserverInfo(
                 host=host,
                 addresses=sorted(set(addresses)),
-                descr=whois_info.descr if whois_info else None,
-                country=whois_info.country if whois_info else None,
+                descr=metadata.get("descr") if metadata else None,
+                country=metadata.get("country") if metadata else None,
+                asn=metadata.get("asn") if metadata else None,
             )
         )
 
@@ -347,6 +375,65 @@ def _query_whois(domain: str) -> Any:
     if not completed.stdout and not completed.stderr:
         raise RuntimeError("empty whois output")
     return "\n".join(part for part in [completed.stdout, completed.stderr] if part)
+
+
+def _collect_cymru_metadata(ip_address: str) -> Optional[dict]:
+    if not ip_address:
+        return None
+
+    query_name = ip_address
+    if ":" not in ip_address:
+        query_name = f"{ip_address}.origin.asn.cymru.com"
+    else:
+        query_name = f"{ip_address}.origin6.asn.cymru.com"
+
+    trace(f"querying Cymru for {ip_address}")
+    try:
+        answers = _query_resolver(dns.resolver.Resolver(), query_name, "TXT")
+    except Exception as exc:
+        trace(f"Cymru lookup failed for {ip_address}: {exc}")
+        return None
+
+    for answer in answers:
+        try:
+            text = answer.to_text().strip().strip('"')
+        except Exception:
+            text = str(answer).strip().strip('"')
+        if not text:
+            continue
+        parts = [part.strip() for part in text.split("|")]
+        if len(parts) < 3:
+            continue
+        asn = parts[0].strip()
+        country = parts[2].strip()
+        if asn or country:
+            return {"asn": asn, "country": country}
+
+    return None
+
+
+def _collect_whois_metadata(ip_address: str) -> Optional[dict]:
+    if not ip_address:
+        return None
+
+    trace(f"querying WHOIS fallback for nameserver IP {ip_address}")
+    try:
+        raw_text = _query_whois(ip_address)
+    except Exception as exc:
+        trace(f"WHOIS fallback failed for {ip_address}: {exc}")
+        return None
+
+    if not isinstance(raw_text, str):
+        raw_text = getattr(raw_text, "text", "") or ""
+
+    parsed = _extract_from_raw(raw_text)
+    result = {
+        "country": parsed.country,
+        "descr": parsed.descr,
+    }
+    if not any(result.values()):
+        return None
+    return result
 
 
 def _collect_whois_via_library(domain: str, use_rdap: bool = True) -> Optional[RegistrarInfo]:
@@ -413,6 +500,8 @@ def display_dns_report(hostname: str, compact: bool = False) -> None:
                     parts.append(f"descr: {ns.descr}")
                 if ns.country:
                     parts.append(f"country: {ns.country}")
+                if ns.asn:
+                    parts.append(f"asn: {ns.asn}")
                 print(f"  - {' | '.join(parts)}")
         else:
             print("  - N/A")
@@ -443,7 +532,8 @@ def display_dns_report(hostname: str, compact: bool = False) -> None:
             joined_ips = ", ".join(ns.addresses) if ns.addresses else "N/A"
             descr = f" | descr: {ns.descr}" if ns.descr else ""
             country = f" | country: {ns.country}" if ns.country else ""
-            print(f"  - {ns.host}: {joined_ips}{descr}{country}")
+            asn = f" | asn: {ns.asn}" if ns.asn else ""
+            print(f"  - {ns.host}: {joined_ips}{descr}{country}{asn}")
     else:
         print("  - N/A")
 
