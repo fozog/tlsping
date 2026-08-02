@@ -71,17 +71,35 @@ def _display_compact_tls_summary(
         from cryptography import x509
         from cryptography.hazmat.backends import default_backend
 
+        from .tls import build_certificate_chain
+
         cert = x509.load_der_x509_certificate(der_cert, default_backend())
+        chain = build_certificate_chain(cert)
+        issuer_name = cert.issuer
+        if len(chain) > 1:
+            issuer_name = chain[-1].subject
         issuer_fields = [
             ("countryName", "countryName"),
-            ("organizationName", "organizationName"),
             ("organizationalUnitName", "organizationalUnitName"),
+            ("organizationName", "organizationName"),
             ("commonName", "commonName"),
         ]
+        issuer_values = []
         for field_name, label in issuer_fields:
-            values = [attr.value for attr in cert.issuer if attr.oid._name == field_name]
+            values = [attr.value for attr in issuer_name if attr.oid._name == field_name]
             if values:
-                print(f"  - {label}: {values[0]}")
+                issuer_values.append((label, values[0]))
+
+        if issuer_values:
+            if any(label == "organizationalUnitName" for label, _ in issuer_values):
+                for label, value in issuer_values:
+                    if label == "organizationalUnitName":
+                        print(f"  - {label}: {value}")
+                    elif label == "countryName":
+                        print(f"  - {label}: {value}")
+            else:
+                for label, value in issuer_values:
+                    print(f"  - {label}: {value}")
     except Exception:
         pass
 

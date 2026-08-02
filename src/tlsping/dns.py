@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -185,6 +186,10 @@ def _to_scalar(value) -> Optional[str]:
 
 
 def _get_rdap_server(domain: str) -> Optional[str]:
+    labels = [label for label in domain.strip(".").split(".") if label]
+    if labels and labels[-1].lower() == "de":
+        return "https://rdap.denic.de/"
+
     bootstrap_url = "https://data.iana.org/rdap/dns.json"
     try:
         with urllib.request.urlopen(bootstrap_url, timeout=10) as response:
@@ -197,7 +202,6 @@ def _get_rdap_server(domain: str) -> Optional[str]:
     except Exception:
         return None
 
-    labels = [label for label in domain.strip(".").split(".") if label]
     suffixes = [".".join(labels[index:]) for index in range(len(labels))]
     for suffix in suffixes:
         for service in bootstrap.get("services", []):
@@ -265,16 +269,32 @@ def _extract_from_rdap(payload: Optional[dict]) -> RegistrarInfo:
                         continue
                     if not entry:
                         continue
+
                     if len(entry) >= 4 and isinstance(entry[0], str) and entry[0].lower() in {"fn", "org"}:
-                        registrar_info.registrar = _to_scalar(entry[3])
-                        break
+                        value = entry[-1] if isinstance(entry[-1], str) else None
+                        if value and not registrar_info.registrar:
+                            registrar_info.registrar = value
+
                     if len(entry) >= 2 and isinstance(entry[1], list):
                         nested = entry[1]
                         if nested and len(nested) >= 4 and isinstance(nested[0], str) and nested[0].lower() in {"fn", "org"}:
-                            registrar_info.registrar = _to_scalar(nested[3])
-                            break
+                            value = nested[-1] if isinstance(nested[-1], str) else None
+                            if value and not registrar_info.registrar:
+                                registrar_info.registrar = value
+
                     if len(entry) >= 2 and isinstance(entry[0], str) and entry[0].lower() in {"fn", "org"}:
-                        registrar_info.registrar = _to_scalar(entry[1])
+                        value = entry[1] if isinstance(entry[1], str) else None
+                        if value and not registrar_info.registrar:
+                            registrar_info.registrar = value
+
+                    if len(entry) >= 5 and isinstance(entry[0], str) and entry[0].lower() == "adr":
+                        address_parts = entry[4]
+                        if isinstance(address_parts, list) and address_parts:
+                            country = _to_scalar(address_parts[-1])
+                            if country and not registrar_info.country:
+                                registrar_info.country = country
+
+                    if registrar_info.registrar and registrar_info.country:
                         break
             break
 
@@ -369,6 +389,66 @@ def _query_whois(domain: str) -> Any:
     return "\n".join(part for part in [completed.stdout, completed.stderr] if part)
 
 
+def _query_webwhois(domain: str) -> Optional[str]:
+    if not domain:
+        return None
+
+    url = f"https://webwhois.denic.de/?lang=en&query={urllib.parse.quote(domain)}"
+    trace(f"querying WebWhois for {domain}")
+    try:
+        with urllib.request.urlopen(url, timeout=10) as response:
+            return response.read().decode("utf-8", errors="ignore")
+    except Exception as exc:
+        trace(f"WebWhois lookup failed for {domain}: {exc}")
+        return None
+
+
+def _extract_from_webwhois(html: Optional[str]) -> Optional[RegistrarInfo]:
+    if not html:
+        trace("WebWhois parser received no HTML content")
+        return None
+
+    registrar_info = RegistrarInfo(source_type="WEBWHOIS")
+    lowered = html.lower()
+    has_domain_management = "domain management" in lowered or "data-list" in lowered or "<th>name</th>" in lowered
+    if not has_domain_management:
+        trace("WebWhois HTML did not contain the expected domain management section")
+        return None
+
+    for label in [("name", r"<(?:th|dt)[^>]*>\s*name\s*</(?:th|dt)>", "(?:td|dd)"), ("country", r"<(?:th|dt)[^>]*>\s*country\s*</(?:th|dt)>", "(?:td|dd)")]:
+        field_name, pattern, value_tag = label
+        match = re.search(pattern, html, re.IGNORECASE | re.DOTALL)
+        if not match:
+            continue
+
+        block = html[match.end():]
+        value_match = re.search(rf"<{value_tag}[^>]*>(.*?)</{value_tag}>", block, re.IGNORECASE | re.DOTALL)
+        if not value_match:
+            continue
+
+        text = " ".join(
+            part.strip()
+            for part in re.sub(r"<[^>]+>", " ", value_match.group(1)).split()
+            if part.strip()
+        )
+
+        if field_name == "name":
+            registrar_info.registrar = text
+            trace(f"WebWhois parsed registrar: {text}")
+        elif field_name == "country":
+            registrar_info.country = text
+            trace(f"WebWhois parsed country: {text}")
+
+    if registrar_info.registrar or registrar_info.country:
+        trace(
+            f"WebWhois extraction succeeded: registrar={registrar_info.registrar or 'N/A'} "
+            f"country={registrar_info.country or 'N/A'}"
+        )
+        return registrar_info
+    trace("WebWhois extraction produced no registrar or country data")
+    return None
+
+
 def _collect_cymru_metadata(ip_address: str) -> Optional[dict]:
     if not ip_address:
         return None
@@ -429,6 +509,17 @@ def _collect_whois_metadata(ip_address: str) -> Optional[dict]:
 
 
 def _collect_registrar_info(domain: str, use_rdap: bool = True) -> Optional[RegistrarInfo]:
+    labels = [label for label in domain.strip(".").split(".") if label]
+    if labels and labels[-1].lower() == "de":
+        trace(f"using .de WebWhois branch for {domain}")
+        webwhois_html = _query_webwhois(domain)
+        trace(f"WebWhois HTML retrieved for {domain}: {'yes' if webwhois_html else 'no'}")
+        webwhois_info = _extract_from_webwhois(webwhois_html)
+        if webwhois_info:
+            trace(f"using WebWhois registrar info for {domain}")
+            return webwhois_info
+        trace(f"WebWhois did not yield registrar info for {domain}")
+
     if use_rdap:
         rdap_payload = _query_rdap(domain)
         rdap_info = _extract_from_rdap(rdap_payload)
@@ -505,6 +596,8 @@ def display_dns_report(hostname: str, compact: bool = False) -> None:
         print(" [Registrar]")
         if report.registrar.registrar:
             print(f"  - name   : {report.registrar.registrar}")
+        if report.registrar.country:
+            print(f"  - country: {report.registrar.country}")
         if report.registrar.record_maintained_by:
             print(f"  - record maintained by : {report.registrar.record_maintained_by}")
 

@@ -235,7 +235,11 @@ def display_cert_info(
             print(f"  - {attr.oid._name}: {attr.value}")
 
         print("\n [Certificate Authority / Issuer]")
-        for attr in cert.issuer:
+        chain = build_certificate_chain(cert)
+        issuer_name = cert.issuer
+        if len(chain) > 1:
+            issuer_name = chain[-1].subject
+        for attr in issuer_name:
             print(f"  - {attr.oid._name}: {attr.value}")
 
         print("\n [Validity Period]")
