@@ -4,9 +4,23 @@ import socket
 import ssl
 import sys
 import urllib.request
-from typing import Any, Dict, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 
 TRACE_ENABLED = False
+
+
+@dataclass(frozen=True)
+class TLSProbeResult:
+    hostname: str
+    port: int
+    der_cert: bytes
+    cert_dict: Dict[str, Any]
+    tls_version: str
+    cipher: Tuple[str, str, int]
+    cert_chain: List[Any]
+    os_trust_ok: bool
+    os_trust_reason: Optional[str]
 
 
 def set_trace_enabled(enabled: bool) -> None:
@@ -27,6 +41,203 @@ def parse_tuple_dict(tuples):
         for key, val in item:
             out[key] = val
     return out
+
+
+def format_name_attributes(name) -> str:
+    parts = []
+    for attr in name:
+        parts.append(f"{attr.oid._name}={attr.value}")
+    return ", ".join(parts)
+
+
+def _compact_subject_lines(result: TLSProbeResult) -> List[str]:
+    lines = [" [Subject Details]"]
+    cert = result.cert_chain[0] if result.cert_chain else None
+    if cert is not None:
+        subject_fields = [
+            ("countryName", "countryName"),
+            ("stateOrProvinceName", "stateOrProvinceName"),
+            ("localityName", "localityName"),
+            ("organizationName", "organizationName"),
+            ("commonName", "commonName"),
+        ]
+        for field_name, label in subject_fields:
+            values = [attr.value for attr in cert.subject if attr.oid._name == field_name]
+            if values:
+                lines.append(f"  - {label}: {values[0]}")
+    return lines
+
+
+def _compact_issuer_lines(result: TLSProbeResult) -> List[str]:
+    lines = [" [Certificate Authority / Issuer]"]
+    cert = result.cert_chain[0] if result.cert_chain else None
+    if cert is not None:
+        issuer_name = cert.issuer
+        if len(result.cert_chain) > 1:
+            issuer_name = result.cert_chain[-1].subject
+        issuer_fields = [
+            ("countryName", "countryName"),
+            ("organizationalUnitName", "organizationalUnitName"),
+            ("organizationName", "organizationName"),
+            ("commonName", "commonName"),
+        ]
+        issuer_values = []
+        for field_name, label in issuer_fields:
+            values = [attr.value for attr in issuer_name if attr.oid._name == field_name]
+            if values:
+                issuer_values.append((label, values[0]))
+
+        if issuer_values:
+            if any(label == "organizationalUnitName" for label, _ in issuer_values):
+                for label, value in issuer_values:
+                    if label == "organizationalUnitName":
+                        lines.append(f"  - {label}: {value}")
+                    elif label == "countryName":
+                        lines.append(f"  - {label}: {value}")
+            else:
+                for label, value in issuer_values:
+                    lines.append(f"  - {label}: {value}")
+    return lines
+
+
+def compact_tls_summary_to_string(result: TLSProbeResult) -> str:
+    lines = ["TLS:"]
+    lines.append(f"Protocol Version : {result.tls_version}")
+    lines.append(f"Cipher Suite     : {result.cipher[0]} ({result.cipher[1]} bits)")
+    lines.extend(_compact_subject_lines(result))
+    lines.append("")
+    lines.extend(_compact_issuer_lines(result))
+    return "\n".join(lines) + "\n"
+
+
+def full_tls_summary_to_string(result: TLSProbeResult) -> str:
+    lines: List[str] = []
+    lines.append("=" * 60)
+    lines.append(f" TLS Handshake Summary for: {result.hostname}:{result.port}")
+    lines.append("=" * 60)
+    lines.append(f"Protocol Version : {result.tls_version}")
+    lines.append(f"Cipher Suite     : {result.cipher[0]} ({result.cipher[1]} bits)")
+    lines.append("-" * 60)
+
+    try:
+        cert = result.cert_chain[0]
+
+        lines.append(" [Subject Details]")
+        for attr in cert.subject:
+            lines.append(f"  - {attr.oid._name}: {attr.value}")
+
+        lines.append("")
+        lines.append(" [Certificate Authority / Issuer]")
+        issuer_name = cert.issuer
+        if len(result.cert_chain) > 1:
+            issuer_name = result.cert_chain[-1].subject
+        for attr in issuer_name:
+            lines.append(f"  - {attr.oid._name}: {attr.value}")
+
+        lines.append("")
+        lines.append(" [Validity Period]")
+        lines.append(f"  - Not Before : {cert.not_valid_before.isoformat()}")
+        lines.append(f"  - Not After  : {cert.not_valid_after.isoformat()}")
+
+        try:
+            from cryptography import x509
+
+            san = cert.extensions.get_extension_for_oid(x509.OID_SUBJECT_ALTERNATIVE_NAME)
+            names = san.value.get_values_for_type(x509.DNSName)
+            lines.append("")
+            lines.append(f" [SAN Domains] ({len(names)} found):")
+            lines.append(f"  - {', '.join(names[:5])}" + ("..." if len(names) > 5 else ""))
+        except Exception:
+            pass
+
+        if len(result.cert_chain) > 1:
+            lines.append("")
+            lines.append(" [Certificate Chain]")
+            for index, chain_cert in enumerate(result.cert_chain):
+                label = "Leaf" if index == 0 else (
+                    "Root" if index == len(result.cert_chain) - 1 and chain_cert.subject == chain_cert.issuer else f"CA-{index}"
+                )
+                lines.append(f"  - {label}")
+                lines.append(f"    * Subject: {format_name_attributes(chain_cert.subject)}")
+                lines.append(f"    * Issuer : {format_name_attributes(chain_cert.issuer)}")
+                try:
+                    from cryptography import x509
+
+                    aia = chain_cert.extensions.get_extension_for_oid(x509.OID_AUTHORITY_INFORMATION_ACCESS).value
+                    ca_issuers = [
+                        desc.access_location.value
+                        for desc in aia
+                        if desc.access_method.dotted_string == "1.3.6.1.5.5.7.48.2"
+                    ]
+                    if ca_issuers:
+                        lines.append(f"    * CA Issuers URLs: {', '.join(ca_issuers)}")
+                except Exception:
+                    pass
+
+                subject_country = [attr.value for attr in chain_cert.subject if attr.oid._name == "countryName"]
+                subject_org = [attr.value for attr in chain_cert.subject if attr.oid._name == "organizationName"]
+                if subject_country or subject_org:
+                    lines.append(
+                        "    * Subject location/org: "
+                        f"country={subject_country[0] if subject_country else 'N/A'}, "
+                        f"org={subject_org[0] if subject_org else 'N/A'}"
+                    )
+
+        lines.append("")
+        lines.append(" [OS Trust]")
+        if result.os_trust_ok:
+            lines.append("  - trustable by OS: yes")
+        else:
+            lines.append("  - trustable by OS: no")
+            if result.os_trust_reason:
+                lines.append(f"  - reason: {result.os_trust_reason}")
+
+    except IndexError:
+        lines.append(" (Note: Install 'cryptography' for full details: pip install cryptography)")
+        lines.append("")
+        subject = parse_tuple_dict(result.cert_dict.get("subject", ()))
+        issuer = parse_tuple_dict(result.cert_dict.get("issuer", ()))
+
+        lines.append(" [Subject]")
+        lines.append(f"  - Common Name : {subject.get('commonName', 'N/A')}")
+        lines.append(f"  - Organization: {subject.get('organizationName', 'N/A')}")
+
+        lines.append("")
+        lines.append(" [Certificate Authority / Issuer]")
+        lines.append(f"  - Common Name : {issuer.get('commonName', 'N/A')}")
+        lines.append(f"  - Organization: {issuer.get('organizationName', 'N/A')}")
+
+        lines.append("")
+        lines.append(" [Validity Period]")
+        lines.append(f"  - Expires On  : {result.cert_dict.get('notAfter')}")
+
+    lines.append("=" * 60)
+    return "\n".join(lines) + "\n"
+
+
+def display_cert_info(result: TLSProbeResult):
+    """Backwards-compatible print wrapper around full TLS formatter."""
+    print(full_tls_summary_to_string(result), end="")
+
+
+def display_compact_tls_summary(result: TLSProbeResult) -> None:
+    """Backwards-compatible print wrapper around compact TLS formatter."""
+    print(compact_tls_summary_to_string(result), end="")
+
+
+def dump_client_hello_info(hostname: str, port: int, context: ssl.SSLContext) -> None:
+    ciphers = context.get_ciphers()
+    cipher_names = ", ".join(cipher["name"] for cipher in ciphers[:8])
+    if len(ciphers) > 8:
+        cipher_names += f", ... ({len(ciphers)} total)"
+
+    trace(f"ClientHello target: {hostname}:{port}")
+    trace(f"ClientHello SNI: {hostname}")
+    trace(f"ClientHello min_version: {context.minimum_version}")
+    trace(f"ClientHello max_version: {context.maximum_version}")
+    trace(f"ClientHello check_hostname: {context.check_hostname}")
+    trace(f"ClientHello verify_mode: {context.verify_mode}")
+    trace(f"ClientHello offered ciphers: {cipher_names}")
 
 
 def load_x509_certificate_from_bytes(data: bytes):
@@ -64,36 +275,6 @@ def fetch_issuer_certificate(cert):
     return None
 
 
-def is_self_signed(cert) -> bool:
-    return cert.subject == cert.issuer
-
-
-def build_certificate_chain(leaf_cert):
-    chain = [leaf_cert]
-    current_cert = leaf_cert
-
-    while not is_self_signed(current_cert):
-        issuer_cert = fetch_issuer_certificate(current_cert)
-        if issuer_cert is None:
-            break
-
-        if any(existing.subject == issuer_cert.subject for existing in chain):
-            trace(f"stopping chain walk on repeated subject: {issuer_cert.subject.rfc4514_string()}")
-            break
-
-        chain.append(issuer_cert)
-        current_cert = issuer_cert
-
-    return chain
-
-
-def format_name_attributes(name) -> str:
-    parts = []
-    for attr in name:
-        parts.append(f"{attr.oid._name}={attr.value}")
-    return ", ".join(parts)
-
-
 def assess_os_trust(hostname: str, port: int, starttls: Optional[str] = None) -> tuple[bool, Optional[str]]:
     context = ssl.create_default_context()
     context.check_hostname = True
@@ -126,26 +307,35 @@ def assess_os_trust(hostname: str, port: int, starttls: Optional[str] = None) ->
         return False, f"network error during trust check: {exc}"
 
 
-def dump_client_hello_info(hostname: str, port: int, context: ssl.SSLContext) -> None:
-    ciphers = context.get_ciphers()
-    cipher_names = ", ".join(cipher["name"] for cipher in ciphers[:8])
-    if len(ciphers) > 8:
-        cipher_names += f", ... ({len(ciphers)} total)"
 
-    trace(f"ClientHello target: {hostname}:{port}")
-    trace(f"ClientHello SNI: {hostname}")
-    trace(f"ClientHello min_version: {context.minimum_version}")
-    trace(f"ClientHello max_version: {context.maximum_version}")
-    trace(f"ClientHello check_hostname: {context.check_hostname}")
-    trace(f"ClientHello verify_mode: {context.verify_mode}")
-    trace(f"ClientHello offered ciphers: {cipher_names}")
+def is_self_signed(cert) -> bool:
+    return cert.subject == cert.issuer
+
+
+def build_certificate_chain(leaf_cert):
+    chain = [leaf_cert]
+    current_cert = leaf_cert
+
+    while not is_self_signed(current_cert):
+        issuer_cert = fetch_issuer_certificate(current_cert)
+        if issuer_cert is None:
+            break
+
+        if any(existing.subject == issuer_cert.subject for existing in chain):
+            trace(f"stopping chain walk on repeated subject: {issuer_cert.subject.rfc4514_string()}")
+            break
+
+        chain.append(issuer_cert)
+        current_cert = issuer_cert
+
+    return chain
 
 
 def get_tls_certificate(
     hostname: str,
     port: int,
     starttls: Optional[str] = None,
-) -> Tuple[Optional[bytes], Optional[Dict[str, Any]], Optional[str], Optional[Tuple[str, str, int]]]:
+) -> TLSProbeResult:
     """
     Connects to hostname:port, executes TLS ClientHello, and returns
     the raw DER-encoded certificate and decoded metadata.
@@ -154,7 +344,8 @@ def get_tls_certificate(
     context.check_hostname = False
     context.verify_mode = ssl.CERT_NONE
 
-    dump_client_hello_info(hostname, port, context)
+    if TRACE_ENABLED:
+        dump_client_hello_info(hostname, port, context)
 
     trace(f"resolving addresses for {hostname}:{port}")
     resolved_addresses = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
@@ -202,112 +393,32 @@ def get_tls_certificate(
             cipher_used = tls_sock.cipher()
             tls_version = tls_sock.version()
 
-            return der_cert, tls_sock.getpeercert(binary_form=False), tls_version, cipher_used
+            cert_dict = tls_sock.getpeercert(binary_form=False)
+
+            cert_chain: List[Any] = []
+            try:
+                from cryptography import x509
+                from cryptography.hazmat.backends import default_backend
+
+                leaf_cert = x509.load_der_x509_certificate(der_cert, default_backend())
+                cert_chain = build_certificate_chain(leaf_cert)
+            except ImportError:
+                trace("cryptography unavailable while building certificate chain")
+            except Exception as exc:
+                trace(f"failed to build certificate chain: {exc}")
+
+            trust_ok, trust_reason = assess_os_trust(hostname, port, starttls=starttls)
+
+            return TLSProbeResult(
+                hostname=hostname,
+                port=port,
+                der_cert=der_cert,
+                cert_dict=cert_dict,
+                tls_version=tls_version,
+                cipher=cipher_used,
+                cert_chain=cert_chain,
+                os_trust_ok=trust_ok,
+                os_trust_reason=trust_reason,
+            )
 
     raise RuntimeError("TLS handshake did not produce certificate data")
-
-
-def display_cert_info(
-    hostname: str,
-    port: int,
-    der_cert: bytes,
-    cert_dict: Dict[str, Any],
-    tls_ver: str,
-    cipher: Tuple[str, str, int],
-    starttls: Optional[str] = None,
-):
-    """Prints formatted certificate and CA details."""
-    print("=" * 60)
-    print(f" TLS Handshake Summary for: {hostname}:{port}")
-    print("=" * 60)
-    print(f"Protocol Version : {tls_ver}")
-    print(f"Cipher Suite     : {cipher[0]} ({cipher[1]} bits)")
-    print("-" * 60)
-
-    try:
-        from cryptography import x509
-        from cryptography.hazmat.backends import default_backend
-
-        cert = x509.load_der_x509_certificate(der_cert, default_backend())
-
-        print(" [Subject Details]")
-        for attr in cert.subject:
-            print(f"  - {attr.oid._name}: {attr.value}")
-
-        print("\n [Certificate Authority / Issuer]")
-        chain = build_certificate_chain(cert)
-        issuer_name = cert.issuer
-        if len(chain) > 1:
-            issuer_name = chain[-1].subject
-        for attr in issuer_name:
-            print(f"  - {attr.oid._name}: {attr.value}")
-
-        print("\n [Validity Period]")
-        print(f"  - Not Before : {cert.not_valid_before.isoformat()}")
-        print(f"  - Not After  : {cert.not_valid_after.isoformat()}")
-
-        try:
-            san = cert.extensions.get_extension_for_oid(x509.OID_SUBJECT_ALTERNATIVE_NAME)
-            names = san.value.get_values_for_type(x509.DNSName)
-            print(f"\n [SAN Domains] ({len(names)} found):")
-            print(f"  - {', '.join(names[:5])}" + ("..." if len(names) > 5 else ""))
-        except Exception:
-            pass
-
-        chain = build_certificate_chain(cert)
-        if len(chain) > 1:
-            print("\n [Certificate Chain]")
-            for index, chain_cert in enumerate(chain):
-                label = "Leaf" if index == 0 else (
-                    "Root" if index == len(chain) - 1 and is_self_signed(chain_cert) else f"CA-{index}"
-                )
-                print(f"  - {label}")
-                print(f"    * Subject: {format_name_attributes(chain_cert.subject)}")
-                print(f"    * Issuer : {format_name_attributes(chain_cert.issuer)}")
-                try:
-                    aia = chain_cert.extensions.get_extension_for_oid(x509.OID_AUTHORITY_INFORMATION_ACCESS).value
-                    ca_issuers = [
-                        desc.access_location.value
-                        for desc in aia
-                        if desc.access_method.dotted_string == "1.3.6.1.5.5.7.48.2"
-                    ]
-                    if ca_issuers:
-                        print(f"    * CA Issuers URLs: {', '.join(ca_issuers)}")
-                except Exception:
-                    pass
-
-                subject_country = [attr.value for attr in chain_cert.subject if attr.oid._name == "countryName"]
-                subject_org = [attr.value for attr in chain_cert.subject if attr.oid._name == "organizationName"]
-                if subject_country or subject_org:
-                    print(
-                        "    * Subject location/org: "
-                        f"country={subject_country[0] if subject_country else 'N/A'}, "
-                        f"org={subject_org[0] if subject_org else 'N/A'}"
-                    )
-
-        trust_ok, trust_reason = assess_os_trust(hostname, port, starttls=starttls)
-        print("\n [OS Trust]")
-        if trust_ok:
-            print("  - trustable by OS: yes")
-        else:
-            print("  - trustable by OS: no")
-            if trust_reason:
-                print(f"  - reason: {trust_reason}")
-
-    except ImportError:
-        print(" (Note: Install 'cryptography' for full details: pip install cryptography)\n")
-        subject = parse_tuple_dict(cert_dict.get("subject", ()))
-        issuer = parse_tuple_dict(cert_dict.get("issuer", ()))
-
-        print(" [Subject]")
-        print(f"  - Common Name : {subject.get('commonName', 'N/A')}")
-        print(f"  - Organization: {subject.get('organizationName', 'N/A')}")
-
-        print("\n [Certificate Authority / Issuer]")
-        print(f"  - Common Name : {issuer.get('commonName', 'N/A')}")
-        print(f"  - Organization: {issuer.get('organizationName', 'N/A')}")
-
-        print("\n [Validity Period]")
-        print(f"  - Expires On  : {cert_dict.get('notAfter')}")
-
-    print("=" * 60)

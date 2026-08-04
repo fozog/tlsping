@@ -4,7 +4,13 @@ import argparse
 from typing import Optional
 
 from .dns import display_dns_report
-from .tls import assess_os_trust, display_cert_info, get_tls_certificate, set_trace_enabled, trace
+from .tls import (
+    compact_tls_summary_to_string,
+    full_tls_summary_to_string,
+    get_tls_certificate,
+    set_trace_enabled,
+    trace,
+)
 
 # Standard protocol port mappings
 PROTOCOL_PORTS = {
@@ -31,87 +37,6 @@ def resolve_port_spec(port_spec: Optional[str]) -> tuple[int, Optional[str]]:
 
     valid = ", ".join(sorted(PROTOCOL_PORTS))
     raise ValueError(f"Unknown port/protocol '{port_spec}'. Use an integer or one of: {valid}")
-
-
-def _display_compact_tls_summary(
-    hostname: str,
-    port: int,
-    der_cert: bytes,
-    cert_dict: Optional[dict],
-    tls_ver: str,
-    cipher: tuple[str, str, int],
-    starttls: Optional[str] = None,
-) -> None:
-    print("TLS:")
-    print(" [Subject Details]")
-
-    try:
-        from cryptography import x509
-        from cryptography.hazmat.backends import default_backend
-
-        cert = x509.load_der_x509_certificate(der_cert, default_backend())
-        subject_fields = [
-            ("countryName", "countryName"),
-            ("stateOrProvinceName", "stateOrProvinceName"),
-            ("localityName", "localityName"),
-            ("organizationName", "organizationName"),
-            ("commonName", "commonName"),
-        ]
-        for field_name, label in subject_fields:
-            values = [attr.value for attr in cert.subject if attr.oid._name == field_name]
-            if values:
-                print(f"  - {label}: {values[0]}")
-    except Exception:
-        pass
-
-    print()
-    print(" [Certificate Authority / Issuer]")
-
-    try:
-        from cryptography import x509
-        from cryptography.hazmat.backends import default_backend
-
-        from .tls import build_certificate_chain
-
-        cert = x509.load_der_x509_certificate(der_cert, default_backend())
-        chain = build_certificate_chain(cert)
-        issuer_name = cert.issuer
-        if len(chain) > 1:
-            issuer_name = chain[-1].subject
-        issuer_fields = [
-            ("countryName", "countryName"),
-            ("organizationalUnitName", "organizationalUnitName"),
-            ("organizationName", "organizationName"),
-            ("commonName", "commonName"),
-        ]
-        issuer_values = []
-        for field_name, label in issuer_fields:
-            values = [attr.value for attr in issuer_name if attr.oid._name == field_name]
-            if values:
-                issuer_values.append((label, values[0]))
-
-        if issuer_values:
-            if any(label == "organizationalUnitName" for label, _ in issuer_values):
-                for label, value in issuer_values:
-                    if label == "organizationalUnitName":
-                        print(f"  - {label}: {value}")
-                    elif label == "countryName":
-                        print(f"  - {label}: {value}")
-            else:
-                for label, value in issuer_values:
-                    print(f"  - {label}: {value}")
-    except Exception:
-        pass
-
-    print()
-    print(" [OS Trust]")
-    trust_ok, trust_reason = assess_os_trust(hostname, port, starttls=starttls)
-    if trust_ok:
-        print("  - trustable by OS: yes")
-    else:
-        print("  - trustable by OS: no")
-        if trust_reason:
-            print(f"  - reason: {trust_reason}")
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -154,15 +79,12 @@ def main() -> int:
         parser.error(str(exc))
 
     try:
-        der, cert_dict, tls_ver, cipher = get_tls_certificate(args.hostname, port, starttls=starttls_mode)
-
-        if der is None or cert_dict is None or tls_ver is None or cipher is None:
-            raise RuntimeError("TLS certificate retrieval did not return complete data")
+        tls_result = get_tls_certificate(args.hostname, port, starttls=starttls_mode)
 
         if args.full:
-            display_cert_info(args.hostname, port, der, cert_dict, tls_ver, cipher, starttls=starttls_mode)
+            print(full_tls_summary_to_string(tls_result), end="")
         else:
-            _display_compact_tls_summary(args.hostname, port, der, cert_dict, tls_ver, cipher, starttls=starttls_mode)
+            print(compact_tls_summary_to_string(tls_result), end="")
     except Exception as exc:
         print(f"\n[ERROR] Failed to retrieve TLS certificate: {exc}")
 

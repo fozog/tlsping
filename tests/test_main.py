@@ -11,7 +11,6 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
 import tlsping.tls as tls
-import tlsping.main as main_module
 from tlsping.main import resolve_port_spec
 
 
@@ -70,18 +69,21 @@ class PortResolutionTests(unittest.TestCase):
             .sign(key, hashes.SHA256(), backend=default_backend())
         )
         der = cert.public_bytes(serialization.Encoding.DER)
+        probe_result = tls.TLSProbeResult(
+            hostname="www.example.com",
+            port=443,
+            der_cert=der,
+            cert_dict={},
+            tls_version="TLSv1.3",
+            cipher=("TLS_AES_256_GCM_SHA384", "256", 1),
+            cert_chain=[cert],
+            os_trust_ok=True,
+            os_trust_reason=None,
+        )
 
         buffer = io.StringIO()
-        with patch.object(main_module, "assess_os_trust", return_value=(True, None)):
-            with redirect_stdout(buffer):
-                main_module._display_compact_tls_summary(
-                    "www.example.com",
-                    443,
-                    der,
-                    {},
-                    "TLSv1.3",
-                    ("TLS_AES_256_GCM_SHA384", "256", 1),
-                )
+        with redirect_stdout(buffer):
+            tls.display_compact_tls_summary(probe_result)
 
         output = buffer.getvalue()
         self.assertIn("countryName: US", output)
@@ -89,4 +91,76 @@ class PortResolutionTests(unittest.TestCase):
         self.assertIn("organizationName: Cisco Systems Inc.", output)
         self.assertIn("commonName: www.cisco.com", output)
         self.assertIn("organizationalUnitName: HydrantID Trusted Certificate Service", output)
-        self.assertIn("commonName: HydrantID Server CA O1", output)
+        self.assertNotIn("organizationName: IdenTrust", output)
+        self.assertNotIn("commonName: HydrantID Server CA O1", output)
+
+    def test_compact_output_uses_root_ca_from_chain(self) -> None:
+        leaf_key = rsa.generate_private_key(public_exponent=65537, key_size=1024, backend=default_backend())
+        intermediate_key = rsa.generate_private_key(public_exponent=65537, key_size=1024, backend=default_backend())
+        root_key = rsa.generate_private_key(public_exponent=65537, key_size=1024, backend=default_backend())
+
+        leaf_subject = x509.Name([
+            x509.NameAttribute(NameOID.COMMON_NAME, "www.example.com"),
+        ])
+        intermediate_subject = x509.Name([
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Example Intermediate CA"),
+        ])
+        root_subject = x509.Name([
+            x509.NameAttribute(NameOID.COUNTRY_NAME, "US"),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Internet Security Research Group"),
+            x509.NameAttribute(NameOID.COMMON_NAME, "ISRG Root X1"),
+        ])
+
+        intermediate_cert = (
+            x509.CertificateBuilder()
+            .subject_name(intermediate_subject)
+            .issuer_name(root_subject)
+            .public_key(intermediate_key.public_key())
+            .serial_number(2)
+            .not_valid_before(datetime.utcnow() - timedelta(days=1))
+            .not_valid_after(datetime.utcnow() + timedelta(days=1))
+            .sign(root_key, hashes.SHA256(), backend=default_backend())
+        )
+        leaf_cert = (
+            x509.CertificateBuilder()
+            .subject_name(leaf_subject)
+            .issuer_name(intermediate_subject)
+            .public_key(leaf_key.public_key())
+            .serial_number(3)
+            .not_valid_before(datetime.utcnow() - timedelta(days=1))
+            .not_valid_after(datetime.utcnow() + timedelta(days=1))
+            .sign(intermediate_key, hashes.SHA256(), backend=default_backend())
+        )
+        root_cert = (
+            x509.CertificateBuilder()
+            .subject_name(root_subject)
+            .issuer_name(root_subject)
+            .public_key(root_key.public_key())
+            .serial_number(4)
+            .not_valid_before(datetime.utcnow() - timedelta(days=1))
+            .not_valid_after(datetime.utcnow() + timedelta(days=1))
+            .sign(root_key, hashes.SHA256(), backend=default_backend())
+        )
+
+        der = leaf_cert.public_bytes(serialization.Encoding.DER)
+        probe_result = tls.TLSProbeResult(
+            hostname="www.example.com",
+            port=443,
+            der_cert=der,
+            cert_dict={},
+            tls_version="TLSv1.3",
+            cipher=("TLS_AES_256_GCM_SHA384", "256", 1),
+            cert_chain=[leaf_cert, intermediate_cert, root_cert],
+            os_trust_ok=True,
+            os_trust_reason=None,
+        )
+
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            tls.display_compact_tls_summary(probe_result)
+
+        output = buffer.getvalue()
+        self.assertIn("countryName: US", output)
+        self.assertIn("organizationName: Internet Security Research Group", output)
+        self.assertIn("commonName: ISRG Root X1", output)
+        self.assertNotIn("Example Intermediate CA", output)
