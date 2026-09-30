@@ -18,12 +18,12 @@
             }
         },
         {
-            "name": "tlsping apple",
+            "name": "tlsping apple (detail)",
             "type": "python",
             "request": "launch",
             "module": "tlsping.main",
             "args": [
-                "--full",
+                "--detail",
                 "play.itunes.apple.com"
             ],
             "console": "integratedTerminal",

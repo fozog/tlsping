@@ -55,16 +55,16 @@ def _name_field(name, field_name: str) -> str:
     return values[0] if values else "N/A"
 
 
-def chain_entry_country_name_to_string(chain_cert, use_issuer: bool = False) -> str:
+def chain_entry_to_string(chain_cert, use_issuer: bool = False) -> str:
     name_source = chain_cert.issuer if use_issuer else chain_cert.subject
     fields = ["countryName", "organizationName", "commonName", "organizationalUnitName"]
-    return "|".join(_name_field(name_source, field_name) for field_name in fields)
+    return "{" + "|".join(_name_field(name_source, field_name) for field_name in fields) + "}"
 
 
 def chain_to_string(result: TLSProbeResult) -> str:
     if len(result.cert_chain) <= 1:
         return ""
-    entries = [chain_entry_country_name_to_string(chain_cert) for chain_cert in result.cert_chain[1:]]
+    entries = [chain_entry_to_string(chain_cert, use_issuer=True) for chain_cert in result.cert_chain[0:]]
     return " > ".join(entries)
 
 
@@ -72,7 +72,7 @@ def root_to_string(result: TLSProbeResult) -> str:
     if not result.cert_chain:
         return ""
     # Root display should reflect the issuer (the CA that signed the last cert), not its subject.
-    return chain_entry_country_name_to_string(result.cert_chain[-1], use_issuer=True)
+    return chain_entry_to_string(result.cert_chain[-1], use_issuer=True)
 
 
 def full_chain_to_string(result: TLSProbeResult) -> str:

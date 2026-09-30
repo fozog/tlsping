@@ -2,7 +2,7 @@
 
 Small Python project organized with a `src/` layout and a dedicated virtual environment.
 
-## Setup
+## Develop
 
 1. Create the virtual environment:
    ```bash
@@ -12,19 +12,18 @@ Small Python project organized with a `src/` layout and a dedicated virtual envi
    ```bash
    source .venv/bin/activate
    ```
-3. Install dependencies:
-   ```bash
-   pip install -e .
-   ```
+
+## Install
+
+```
+sudo pip install git+https://github.com/fozog/tlsping.git
+```
 
 ## Run
 
 ```bash
-python -m tlsping.main --port NTS-KE nts.netnod.se
+tlsping impots.gouv.fr
+tlsping --full play.itunes.apple.com
+tlsping --port NTS-KE nts.netnod.se
 ```
 
-## Test
-
-```bash
-python -m unittest discover -s tests -v
-```
