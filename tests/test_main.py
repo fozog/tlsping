@@ -1,6 +1,6 @@
 import io
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import redirect_stderr
 from datetime import datetime, timedelta
 from unittest.mock import patch
 
@@ -43,7 +43,7 @@ class PortResolutionTests(unittest.TestCase):
         self.assertEqual(443, port)
         self.assertIsNone(starttls)
 
-    def test_compact_output_includes_subject_and_issuer_fields(self) -> None:
+    def test_root_output_uses_priority_name(self) -> None:
         key = rsa.generate_private_key(public_exponent=65537, key_size=1024, backend=default_backend())
         subject = x509.Name([
             x509.NameAttribute(NameOID.COUNTRY_NAME, "US"),
@@ -81,20 +81,10 @@ class PortResolutionTests(unittest.TestCase):
             os_trust_reason=None,
         )
 
-        buffer = io.StringIO()
-        with redirect_stdout(buffer):
-            tls.display_compact_tls_summary(probe_result)
+        self.assertEqual("US:Cisco Systems Inc.", tls.root_to_string(probe_result))
+        self.assertEqual("", tls.chain_to_string(probe_result))
 
-        output = buffer.getvalue()
-        self.assertIn("countryName: US", output)
-        self.assertIn("stateOrProvinceName: California", output)
-        self.assertIn("organizationName: Cisco Systems Inc.", output)
-        self.assertIn("commonName: www.cisco.com", output)
-        self.assertIn("organizationalUnitName: HydrantID Trusted Certificate Service", output)
-        self.assertNotIn("organizationName: IdenTrust", output)
-        self.assertNotIn("commonName: HydrantID Server CA O1", output)
-
-    def test_compact_output_uses_root_ca_from_chain(self) -> None:
+    def test_chain_and_root_outputs_use_priority(self) -> None:
         leaf_key = rsa.generate_private_key(public_exponent=65537, key_size=1024, backend=default_backend())
         intermediate_key = rsa.generate_private_key(public_exponent=65537, key_size=1024, backend=default_backend())
         root_key = rsa.generate_private_key(public_exponent=65537, key_size=1024, backend=default_backend())
@@ -155,12 +145,5 @@ class PortResolutionTests(unittest.TestCase):
             os_trust_reason=None,
         )
 
-        buffer = io.StringIO()
-        with redirect_stdout(buffer):
-            tls.display_compact_tls_summary(probe_result)
-
-        output = buffer.getvalue()
-        self.assertIn("countryName: US", output)
-        self.assertIn("organizationName: Internet Security Research Group", output)
-        self.assertIn("commonName: ISRG Root X1", output)
-        self.assertNotIn("Example Intermediate CA", output)
+        self.assertEqual("N/A:Example Intermediate CA > US:Internet Security Research Group", tls.chain_to_string(probe_result))
+        self.assertEqual("US:Internet Security Research Group", tls.root_to_string(probe_result))

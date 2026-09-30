@@ -1,3 +1,4 @@
+import io
 import unittest
 from io import BytesIO
 from types import SimpleNamespace
@@ -76,6 +77,22 @@ class DnsCompatibilityTests(unittest.TestCase):
         self.assertEqual("Example Registry", report.registrar.record_maintained_by)
         self.assertEqual("SE", report.registrar.country)
 
+    def test_display_dns_report_compact_includes_country(self) -> None:
+        report = SimpleNamespace(
+            registrar=SimpleNamespace(registrar="Example Registrar", record_maintained_by="Example Registry", country="SE"),
+            nameservers=[],
+            warnings=[],
+        )
+
+        with patch.object(dns_module, "collect_dns_report", return_value=report):
+            with io.StringIO() as stream:
+                with unittest.mock.patch("sys.stdout", stream):
+                    dns_module.display_dns_report("example.com", compact=True)
+                output = stream.getvalue()
+
+        self.assertIn("country", output)
+        self.assertIn("SE", output)
+
     def test_extract_from_raw_preserves_record_maintained_by(self) -> None:
         raw_text = "Registrar:\n   Example Registrar\n   1 Main Street\n\nRecord maintained by: Example Registry\nCountry: SE\n"
 
@@ -105,6 +122,25 @@ class DnsCompatibilityTests(unittest.TestCase):
 
         self.assertEqual("RDAP", parsed.source_type)
         self.assertEqual("Example Registrar", parsed.registrar)
+
+    def test_extract_from_rdap_uses_vcard_country(self) -> None:
+        payload = {
+            "entities": [
+                {
+                    "roles": ["registrar"],
+                    "vcardArray": [
+                        [],
+                        ["fn", {}, {}, "text", "Example Registrar"],
+                        ["adr", {}, {}, "text", ["", "", "", "", "", "", "SE"]],
+                    ],
+                }
+            ]
+        }
+
+        parsed = dns_module._extract_from_rdap(payload)
+
+        self.assertEqual("Example Registrar", parsed.registrar)
+        self.assertEqual("SE", parsed.country)
 
     def test_get_rdap_server_uses_iana_bootstrap(self) -> None:
         class FakeResponse:
@@ -147,6 +183,51 @@ class DnsCompatibilityTests(unittest.TestCase):
             server = dns_module._get_rdap_server("www.cisco.com")
 
         self.assertEqual("https://rdap.verisign.com/", server)
+
+    def test_get_rdap_server_uses_denic_for_de_domains(self) -> None:
+        with patch.object(dns_module.urllib.request, "urlopen", side_effect=AssertionError("bootstrap should not be consulted")):
+            server = dns_module._get_rdap_server("ptb.de")
+
+        self.assertEqual("https://rdap.denic.de/", server)
+
+    def test_collect_registrar_info_uses_webwhois_for_de_domains(self) -> None:
+        class FakeResponse:
+            def __init__(self, payload: str) -> None:
+                self._payload = payload.encode("utf-8")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self) -> bytes:
+                return self._payload
+
+        html = """
+        <html><body>
+        <h2>Information about domain management</h2>
+        <table>
+          <tr><th>Name</th><td>Example Registrar</td></tr>
+          <tr><th>Country</th><td>DE</td></tr>
+        </table>
+        </body></html>
+        """
+
+        with patch.object(dns_module.urllib.request, "urlopen", return_value=FakeResponse(html)), patch.object(
+            dns_module,
+            "_query_whois",
+            side_effect=AssertionError("WHOIS should not be used for .de domains"),
+        ), patch.object(
+            dns_module,
+            "_query_rdap",
+            side_effect=AssertionError("RDAP should not be used for .de domains"),
+        ):
+            info = dns_module._collect_registrar_info("ptb.de")
+
+        self.assertEqual("Example Registrar", info.registrar)
+        self.assertEqual("DE", info.country)
+        self.assertEqual("WEBWHOIS", info.source_type)
 
     def test_collect_dns_report_uses_library_whois_data(self) -> None:
         fake_whois_data = SimpleNamespace(

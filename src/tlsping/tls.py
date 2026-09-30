@@ -50,141 +50,90 @@ def format_name_attributes(name) -> str:
     return ", ".join(parts)
 
 
-def _compact_subject_lines(result: TLSProbeResult) -> List[str]:
-    lines = [" [Subject Details]"]
-    cert = result.cert_chain[0] if result.cert_chain else None
-    if cert is not None:
-        subject_fields = [
-            ("countryName", "countryName"),
-            ("stateOrProvinceName", "stateOrProvinceName"),
-            ("localityName", "localityName"),
-            ("organizationName", "organizationName"),
-            ("commonName", "commonName"),
-        ]
-        for field_name, label in subject_fields:
-            values = [attr.value for attr in cert.subject if attr.oid._name == field_name]
-            if values:
-                lines.append(f"  - {label}: {values[0]}")
-    return lines
+def _priority_name_from_subject(subject) -> str:
+    # Priority agreed for issuer/name display: OU > Organization > Common Name.
+    name_fields = ["organizationalUnitName", "organizationName", "commonName"]
+    for field_name in name_fields:
+        values = [attr.value for attr in subject if attr.oid._name == field_name]
+        if values:
+            return values[0]
+    return "N/A"
 
 
-def _compact_issuer_lines(result: TLSProbeResult) -> List[str]:
-    lines = [" [Certificate Authority / Issuer]"]
-    cert = result.cert_chain[0] if result.cert_chain else None
-    if cert is not None:
-        issuer_name = cert.issuer
-        if len(result.cert_chain) > 1:
-            issuer_name = result.cert_chain[-1].subject
-        issuer_fields = [
-            ("countryName", "countryName"),
-            ("organizationalUnitName", "organizationalUnitName"),
-            ("organizationName", "organizationName"),
-            ("commonName", "commonName"),
-        ]
-        issuer_values = []
-        for field_name, label in issuer_fields:
-            values = [attr.value for attr in issuer_name if attr.oid._name == field_name]
-            if values:
-                issuer_values.append((label, values[0]))
-
-        if issuer_values:
-            if any(label == "organizationalUnitName" for label, _ in issuer_values):
-                for label, value in issuer_values:
-                    if label == "organizationalUnitName":
-                        lines.append(f"  - {label}: {value}")
-                    elif label == "countryName":
-                        lines.append(f"  - {label}: {value}")
-            else:
-                for label, value in issuer_values:
-                    lines.append(f"  - {label}: {value}")
-    return lines
+def chain_entry_country_name_to_string(chain_cert) -> str:
+    subject = chain_cert.subject
+    country_values = [attr.value for attr in subject if attr.oid._name == "countryName"]
+    country = country_values[0] if country_values else "N/A"
+    name = _priority_name_from_subject(subject)
+    return f"{country}:{name}"
 
 
-def compact_tls_summary_to_string(result: TLSProbeResult) -> str:
-    lines = ["TLS:"]
-    lines.append(f"Protocol Version : {result.tls_version}")
-    lines.append(f"Cipher Suite     : {result.cipher[0]} ({result.cipher[1]} bits)")
-    lines.extend(_compact_subject_lines(result))
-    lines.append("")
-    lines.extend(_compact_issuer_lines(result))
-    return "\n".join(lines) + "\n"
+def chain_to_string(result: TLSProbeResult) -> str:
+    if len(result.cert_chain) <= 1:
+        return ""
+    entries = [chain_entry_country_name_to_string(chain_cert) for chain_cert in result.cert_chain[1:]]
+    return " > ".join(entries)
 
 
-def full_tls_summary_to_string(result: TLSProbeResult) -> str:
+def root_to_string(result: TLSProbeResult) -> str:
+    if not result.cert_chain:
+        return ""
+    return chain_entry_country_name_to_string(result.cert_chain[-1])
+
+
+def full_chain_to_string(result: TLSProbeResult) -> str:
     lines: List[str] = []
-    lines.append("=" * 60)
-    lines.append(f" TLS Handshake Summary for: {result.hostname}:{result.port}")
-    lines.append("=" * 60)
-    lines.append(f"Protocol Version : {result.tls_version}")
-    lines.append(f"Cipher Suite     : {result.cipher[0]} ({result.cipher[1]} bits)")
-    lines.append("-" * 60)
+    lines.append("[TLS]")
+    lines.append(f" - Protocol Version : {result.tls_version}")
+    lines.append(f" - Cipher Suite     : {result.cipher[0]} ({result.cipher[1]} bits)")
 
     try:
-        cert = result.cert_chain[0]
-
-        lines.append(" [Subject Details]")
-        for attr in cert.subject:
-            lines.append(f"  - {attr.oid._name}: {attr.value}")
-
         lines.append("")
-        lines.append(" [Certificate Authority / Issuer]")
-        issuer_name = cert.issuer
-        if len(result.cert_chain) > 1:
-            issuer_name = result.cert_chain[-1].subject
-        for attr in issuer_name:
-            lines.append(f"  - {attr.oid._name}: {attr.value}")
+        lines.append("[Certificate Chain]")
+        for index, chain_cert in enumerate(result.cert_chain):
+            label = "Leaf" if index == 0 else (
+                "Root" if index == len(result.cert_chain) - 1 and chain_cert.subject == chain_cert.issuer else f"CA-{index}"
+            )
+            lines.append(f"  - {label}")
+            lines.append(f"    * Subject: {format_name_attributes(chain_cert.subject)}")
+            lines.append(f"    * Issuer : {format_name_attributes(chain_cert.issuer)}")
+            lines.append(f"    * Validity: {chain_cert.not_valid_before.isoformat()} - {chain_cert.not_valid_after.isoformat()}")
+            try:
+                from cryptography import x509
 
-        lines.append("")
-        lines.append(" [Validity Period]")
-        lines.append(f"  - Not Before : {cert.not_valid_before.isoformat()}")
-        lines.append(f"  - Not After  : {cert.not_valid_after.isoformat()}")
+                aia = chain_cert.extensions.get_extension_for_oid(x509.OID_AUTHORITY_INFORMATION_ACCESS).value
+                ca_issuers = [
+                    desc.access_location.value
+                    for desc in aia
+                    if desc.access_method.dotted_string == "1.3.6.1.5.5.7.48.2"
+                ]
+                if ca_issuers:
+                    lines.append(f"    * CA Issuers URLs: {', '.join(ca_issuers)}")
+            except Exception:
+                pass
 
-        try:
-            from cryptography import x509
+            try:
+                from cryptography import x509
 
-            san = cert.extensions.get_extension_for_oid(x509.OID_SUBJECT_ALTERNATIVE_NAME)
-            names = san.value.get_values_for_type(x509.DNSName)
-            lines.append("")
-            lines.append(f" [SAN Domains] ({len(names)} found):")
-            lines.append(f"  - {', '.join(names[:5])}" + ("..." if len(names) > 5 else ""))
-        except Exception:
-            pass
+                san = chain_cert.extensions.get_extension_for_oid(x509.OID_SUBJECT_ALTERNATIVE_NAME)
+                names = san.value.get_values_for_type(x509.DNSName)
+                lines.append(f"    * SAN Domain(s):  {', '.join(names[:5])}" + ("..." if len(names) > 5 else ""))
 
-        if len(result.cert_chain) > 1:
-            lines.append("")
-            lines.append(" [Certificate Chain]")
-            for index, chain_cert in enumerate(result.cert_chain):
-                label = "Leaf" if index == 0 else (
-                    "Root" if index == len(result.cert_chain) - 1 and chain_cert.subject == chain_cert.issuer else f"CA-{index}"
+            except Exception:
+                pass
+
+
+            subject_country = [attr.value for attr in chain_cert.subject if attr.oid._name == "countryName"]
+            subject_org = [attr.value for attr in chain_cert.subject if attr.oid._name == "organizationName"]
+            if subject_country or subject_org:
+                lines.append(
+                    "    * Subject location/org: "
+                    f"country={subject_country[0] if subject_country else 'N/A'}, "
+                    f"org={subject_org[0] if subject_org else 'N/A'}"
                 )
-                lines.append(f"  - {label}")
-                lines.append(f"    * Subject: {format_name_attributes(chain_cert.subject)}")
-                lines.append(f"    * Issuer : {format_name_attributes(chain_cert.issuer)}")
-                try:
-                    from cryptography import x509
-
-                    aia = chain_cert.extensions.get_extension_for_oid(x509.OID_AUTHORITY_INFORMATION_ACCESS).value
-                    ca_issuers = [
-                        desc.access_location.value
-                        for desc in aia
-                        if desc.access_method.dotted_string == "1.3.6.1.5.5.7.48.2"
-                    ]
-                    if ca_issuers:
-                        lines.append(f"    * CA Issuers URLs: {', '.join(ca_issuers)}")
-                except Exception:
-                    pass
-
-                subject_country = [attr.value for attr in chain_cert.subject if attr.oid._name == "countryName"]
-                subject_org = [attr.value for attr in chain_cert.subject if attr.oid._name == "organizationName"]
-                if subject_country or subject_org:
-                    lines.append(
-                        "    * Subject location/org: "
-                        f"country={subject_country[0] if subject_country else 'N/A'}, "
-                        f"org={subject_org[0] if subject_org else 'N/A'}"
-                    )
 
         lines.append("")
-        lines.append(" [OS Trust]")
+        lines.append("[OS Trust]")
         if result.os_trust_ok:
             lines.append("  - trustable by OS: yes")
         else:
@@ -211,18 +160,7 @@ def full_tls_summary_to_string(result: TLSProbeResult) -> str:
         lines.append(" [Validity Period]")
         lines.append(f"  - Expires On  : {result.cert_dict.get('notAfter')}")
 
-    lines.append("=" * 60)
     return "\n".join(lines) + "\n"
-
-
-def display_cert_info(result: TLSProbeResult):
-    """Backwards-compatible print wrapper around full TLS formatter."""
-    print(full_tls_summary_to_string(result), end="")
-
-
-def display_compact_tls_summary(result: TLSProbeResult) -> None:
-    """Backwards-compatible print wrapper around compact TLS formatter."""
-    print(compact_tls_summary_to_string(result), end="")
 
 
 def dump_client_hello_info(hostname: str, port: int, context: ssl.SSLContext) -> None:

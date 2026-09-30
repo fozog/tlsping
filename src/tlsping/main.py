@@ -5,9 +5,10 @@ from typing import Optional
 
 from .dns import display_dns_report
 from .tls import (
-    compact_tls_summary_to_string,
-    full_tls_summary_to_string,
+    chain_to_string,
+    full_chain_to_string,
     get_tls_certificate,
+    root_to_string,
     set_trace_enabled,
     trace,
 )
@@ -52,6 +53,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default="HTTPS",
         help="Port number or protocol alias. Defaults to HTTPS. This probe is TCP/TLS only; no UDP support.",
     )
+
+    parser.add_argument(
+        "--with-dns",
+        action="store_true",
+        help="Activate DNS printing.",
+    )
     parser.add_argument(
         "--trace",
         "--traces",
@@ -59,6 +66,13 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print trace logs while resolving and connecting.",
     )
+
+    parser.add_argument(
+        "--detailed",
+        action="store_true",
+        help="Show the certificate and DNS detail output in a more verbose format.",
+    )
+
     parser.add_argument(
         "--full",
         action="store_true",
@@ -82,21 +96,24 @@ def main() -> int:
         tls_result = get_tls_certificate(args.hostname, port, starttls=starttls_mode)
 
         if args.full:
-            print(full_tls_summary_to_string(tls_result), end="")
+            print(full_chain_to_string(tls_result))
+        elif args.detailed:
+            print(chain_to_string(tls_result))
         else:
-            print(compact_tls_summary_to_string(tls_result), end="")
+            print(root_to_string(tls_result))
     except Exception as exc:
         print(f"\n[ERROR] Failed to retrieve TLS certificate: {exc}")
 
-    try:
-        if args.full:
-            display_dns_report(args.hostname)
-        else:
-            print("DNS:")
-            display_dns_report(args.hostname, compact=True)
-    except Exception as exc:
-        trace(f"DNS summary failed: {exc}")
-        print(f"\n[WARN] Failed to collect DNS summary: {exc}")
+    if args.with_dns:
+        try:
+            if args.full:
+                display_dns_report(args.hostname)
+            else:
+                print("DNS:")
+                display_dns_report(args.hostname, compact=True)
+        except Exception as exc:
+            trace(f"DNS summary failed: {exc}")
+            print(f"\n[WARN] Failed to collect DNS summary: {exc}")
 
     return 0
 
