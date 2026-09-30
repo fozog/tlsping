@@ -2,7 +2,7 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Python: tlsping",
+            "name": "tlsping netnod",
             "type": "python",
             "request": "launch",
             "module": "tlsping.main",
@@ -10,6 +10,35 @@
                 "--port",
                 "NTS-KE",
                 "nts.netnod.se"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src"
+            }
+        },
+        {
+            "name": "tlsping apple",
+            "type": "python",
+            "request": "launch",
+            "module": "tlsping.main",
+            "args": [
+                "--full",
+                "play.itunes.apple.com"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src"
+            }
+        },
+        {
+            "name": "tlsping apple",
+            "type": "python",
+            "request": "launch",
+            "module": "tlsping.main",
+            "args": [
+                "play.itunes.apple.com"
             ],
             "console": "integratedTerminal",
             "justMyCode": true,

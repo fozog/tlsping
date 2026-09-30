@@ -50,22 +50,15 @@ def format_name_attributes(name) -> str:
     return ", ".join(parts)
 
 
-def _priority_name_from_subject(subject) -> str:
-    # Priority agreed for issuer/name display: OU > Organization > Common Name.
-    name_fields = ["organizationalUnitName", "organizationName", "commonName"]
-    for field_name in name_fields:
-        values = [attr.value for attr in subject if attr.oid._name == field_name]
-        if values:
-            return values[0]
-    return "N/A"
+def _name_field(name, field_name: str) -> str:
+    values = [attr.value for attr in name if attr.oid._name == field_name]
+    return values[0] if values else "N/A"
 
 
-def chain_entry_country_name_to_string(chain_cert) -> str:
-    subject = chain_cert.subject
-    country_values = [attr.value for attr in subject if attr.oid._name == "countryName"]
-    country = country_values[0] if country_values else "N/A"
-    name = _priority_name_from_subject(subject)
-    return f"{country}:{name}"
+def chain_entry_country_name_to_string(chain_cert, use_issuer: bool = False) -> str:
+    name_source = chain_cert.issuer if use_issuer else chain_cert.subject
+    fields = ["countryName", "organizationName", "commonName", "organizationalUnitName"]
+    return "|".join(_name_field(name_source, field_name) for field_name in fields)
 
 
 def chain_to_string(result: TLSProbeResult) -> str:
@@ -78,7 +71,8 @@ def chain_to_string(result: TLSProbeResult) -> str:
 def root_to_string(result: TLSProbeResult) -> str:
     if not result.cert_chain:
         return ""
-    return chain_entry_country_name_to_string(result.cert_chain[-1])
+    # Root display should reflect the issuer (the CA that signed the last cert), not its subject.
+    return chain_entry_country_name_to_string(result.cert_chain[-1], use_issuer=True)
 
 
 def full_chain_to_string(result: TLSProbeResult) -> str:
